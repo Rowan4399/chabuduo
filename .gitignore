@@ -1,0 +1,14 @@
+.DS_Store
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pi/
+.pi-subagents/
+__pycache__/
+*.py[cod]
+dist/
+data/*
+!data/README.md
+runs/*
+!runs/README.md

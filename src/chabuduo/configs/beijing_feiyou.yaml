@@ -1,0 +1,9 @@
+name: beijing
+version: v1
+source:
+  type: feiyou_csv
+  filename: 2025-07-28_2025-08-03.parquet
+  pattern: "**/20??-??-??.csv"
+  start_date: 2025-07-28
+  end_date: 2025-08-03
+  chunk_rows: 250000

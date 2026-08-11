@@ -1,0 +1,176 @@
+"""Convert daily Feiyou CSV observations to a Traffic-compatible Parquet."""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+SOURCE_COLUMNS = [
+    "position_time",
+    "lat",
+    "lng",
+    "altitude",
+    "speed",
+    "ver_speed",
+    "heading",
+    "callsign",
+    "icao",
+]
+
+OUTPUT_SCHEMA = pa.schema(
+    [
+        pa.field("timestamp", pa.timestamp("ns", tz="UTC")),
+        pa.field("latitude", pa.float64()),
+        pa.field("longitude", pa.float64()),
+        pa.field("altitude", pa.float64()),
+        pa.field("groundspeed", pa.float64()),
+        pa.field("vertical_rate", pa.float64()),
+        pa.field("heading", pa.float64()),
+        pa.field("callsign", pa.string()),
+        pa.field("icao24", pa.string()),
+    ]
+)
+
+METERS_TO_FEET = 1 / 0.3048
+MPS_TO_KNOTS = 1 / 0.5144444444444445
+MPS_TO_FEET_PER_MINUTE = 60 / 0.3048
+
+CONVERSION = {
+    "timestamp": "position_time milliseconds since epoch to UTC",
+    "latitude": "lat degrees",
+    "longitude": "lng degrees",
+    "altitude": "altitude metres to feet",
+    "groundspeed": "speed metres per second to knots",
+    "vertical_rate": "ver_speed metres per second to feet per minute",
+    "heading": "heading degrees",
+    "callsign": "callsign",
+    "icao24": "icao decimal integer to six-character hexadecimal",
+}
+
+
+def _date(value: date | str) -> date:
+    return value if isinstance(value, date) else date.fromisoformat(value)
+
+
+def discover_files(
+    source: Path,
+    *,
+    pattern: str,
+    start_date: date | str,
+    end_date: date | str,
+) -> list[Path]:
+    """Return exactly one chronologically ordered CSV for each requested day."""
+    start = _date(start_date)
+    end = _date(end_date)
+    if end < start:
+        raise ValueError("Feiyou end_date must not be earlier than start_date")
+
+    candidates = [source] if source.is_file() else sorted(source.glob(pattern))
+    by_date: dict[date, list[Path]] = {}
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            file_date = date.fromisoformat(path.stem)
+        except ValueError as error:
+            raise ValueError(
+                f"Feiyou CSV filename must be YYYY-MM-DD: {path}"
+            ) from error
+        if start <= file_date <= end:
+            by_date.setdefault(file_date, []).append(path)
+
+    expected = [
+        start + timedelta(days=offset) for offset in range((end - start).days + 1)
+    ]
+    missing = [str(day) for day in expected if day not in by_date]
+    duplicates = {
+        str(day): [str(path) for path in paths]
+        for day, paths in by_date.items()
+        if len(paths) != 1
+    }
+    if missing or duplicates:
+        details = []
+        if missing:
+            details.append(f"missing dates: {', '.join(missing)}")
+        if duplicates:
+            details.append(f"duplicate dates: {duplicates}")
+        raise ValueError("Invalid Feiyou source set; " + "; ".join(details))
+    return [by_date[day][0] for day in expected]
+
+
+def _convert_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
+    icao = pd.to_numeric(chunk["icao"], errors="raise").astype("int64")
+    if ((icao < 0) | (icao > 0xFFFFFF)).any():
+        raise ValueError("Feiyou icao values must fit in a 24-bit address")
+
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                chunk["position_time"], unit="ms", utc=True, errors="raise"
+            ),
+            "latitude": pd.to_numeric(chunk["lat"], errors="raise"),
+            "longitude": pd.to_numeric(chunk["lng"], errors="raise"),
+            "altitude": pd.to_numeric(chunk["altitude"], errors="raise")
+            * METERS_TO_FEET,
+            "groundspeed": pd.to_numeric(chunk["speed"], errors="raise")
+            * MPS_TO_KNOTS,
+            "vertical_rate": pd.to_numeric(chunk["ver_speed"], errors="raise")
+            * MPS_TO_FEET_PER_MINUTE,
+            "heading": pd.to_numeric(chunk["heading"], errors="raise"),
+            "callsign": chunk["callsign"].astype("string"),
+            "icao24": icao.map(lambda value: f"{value:06x}").astype("string"),
+        }
+    )
+
+
+def convert_files(
+    sources: list[Path],
+    destination: Path,
+    *,
+    chunk_rows: int = 250_000,
+) -> dict[str, Any]:
+    """Stream daily CSV files into one atomically replaced Parquet artifact."""
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be positive")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+
+    rows_by_source: list[dict[str, Any]] = []
+    total_rows = 0
+    try:
+        with pq.ParquetWriter(temporary, OUTPUT_SCHEMA, compression="snappy") as writer:
+            for source in sources:
+                source_rows = 0
+                chunks = pd.read_csv(
+                    source,
+                    usecols=SOURCE_COLUMNS,
+                    chunksize=chunk_rows,
+                    low_memory=False,
+                )
+                for chunk in chunks:
+                    converted = _convert_chunk(chunk)
+                    table = pa.Table.from_pandas(
+                        converted,
+                        schema=OUTPUT_SCHEMA,
+                        preserve_index=False,
+                        safe=True,
+                    )
+                    writer.write_table(table)
+                    source_rows += len(converted)
+                    total_rows += len(converted)
+                    print(f"{total_rows:,} rows written", flush=True)
+                rows_by_source.append({"path": str(source), "rows": source_rows})
+        if total_rows == 0:
+            raise ValueError("The Feiyou source files contain no observations")
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+    return {"rows": total_rows, "sources": rows_by_source}

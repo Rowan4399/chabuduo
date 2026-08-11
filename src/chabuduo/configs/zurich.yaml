@@ -1,0 +1,28 @@
+name: zurich
+version: v1
+source:
+  type: traffic_dataset
+  dataset: landing_zurich_2019
+  filename: landing_zurich_2019.parquet
+selection:
+  airport: LSZH
+  detect_landing: false
+  stop_at_landing: false
+  radius_nm: 40
+  remove_duplicate_timestamps: true
+representation:
+  name: projected_position_200
+  points: 200
+  features: [east_m, north_m, altitude_m]
+  context: [elapsed_time_sec]
+  direction: chronological
+  projection: airport_centered_aeqd
+split:
+  group_by: flight_id
+  train: 0.70
+  validation: 0.15
+  test: 0.15
+  seed: 42
+normalization:
+  method: standard
+  fit_on: train
