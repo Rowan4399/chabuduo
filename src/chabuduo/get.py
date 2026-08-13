@@ -88,11 +88,17 @@ def stage_dataset(
             "source": str(source),
         }
     elif source_type == "feiyou_csv":
+        date_ranges = []
+        for date_range in source_config["date_ranges"]:
+            date_ranges.append((Path(date_range["path"]), 
+                                (date_range["start_date"], date_range["end_date"])))
+
         sources = discover_files(
             source,
             pattern=source_config["pattern"],
-            start_date=source_config["start_date"],
-            end_date=source_config["end_date"],
+            #start_date=source_config["start_date"],
+            #end_date=source_config["end_date"],
+            date_ranges=date_ranges,
         )
         conversion = convert_files(
             sources,
@@ -104,8 +110,15 @@ def stage_dataset(
             "mode": "feiyou_csv_conversion",
             "source_root": str(source),
             "pattern": source_config["pattern"],
-            "start_date": str(source_config["start_date"]),
-            "end_date": str(source_config["end_date"]),
+            #"start_date": str(source_config["start_date"]),
+            #"end_date": str(source_config["end_date"]),
+            "date_ranges": [
+                {"path": str(relative_path),
+                 "start_date": str(start_date),
+                 "end_date": str(end_date),
+                }
+                for relative_path, (start_date, end_date) in date_ranges
+            ],
             "conversion": CONVERSION,
             "rows": conversion["rows"],
             "sources": [

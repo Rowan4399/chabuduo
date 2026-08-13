@@ -61,32 +61,71 @@ def discover_files(
     source: Path,
     *,
     pattern: str,
-    start_date: date | str,
-    end_date: date | str,
+    #start_date: date | str,
+    #end_date: date | str,
+    date_ranges: list[tuple[Path, tuple[date | str, date | str]]],
 ) -> list[Path]:
     """Return exactly one chronologically ordered CSV for each requested day."""
-    start = _date(start_date)
-    end = _date(end_date)
-    if end < start:
-        raise ValueError("Feiyou end_date must not be earlier than start_date")
+    if not date_ranges:
+        raise ValueError("Feiyou date_ranges must not be empty")
 
-    candidates = [source] if source.is_file() else sorted(source.glob(pattern))
+    expected_dates: set[date] = set()
     by_date: dict[date, list[Path]] = {}
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            file_date = date.fromisoformat(path.stem)
-        except ValueError as error:
-            raise ValueError(
-                f"Feiyou CSV filename must be YYYY-MM-DD: {path}"
-            ) from error
-        if start <= file_date <= end:
-            by_date.setdefault(file_date, []).append(path)
+    for index, (relative_path, (start_value, end_value)) in enumerate(date_ranges, start=1):
 
-    expected = [
-        start + timedelta(days=offset) for offset in range((end - start).days + 1)
-    ]
+        start = _date(start_value)
+        end = _date(end_value)
+        if end < start:
+            raise ValueError(f"Feiyou date range {index} has end_date earlier than start_date")
+
+        directory = source / relative_path
+        if not directory.is_dir():
+            raise FileNotFoundError(
+                f"Feiyou date range {index} source directory "
+                f"does not exist: {directory}"
+            )
+        range_dates = {
+            start + timedelta(days=offset)
+            for offset in range((end - start).days + 1)
+        }
+        
+        overlap = expected_dates & range_dates
+        if overlap:
+            raise ValueError(
+                f"Feiyou date ranges overlap: "
+                f"{', '.join(str(day) for day in sorted(overlap))}"
+            )
+
+        expected_dates.update(range_dates)
+
+        candidates = sorted(directory.glob(pattern))
+        for path in candidates:
+                if not path.is_file():
+                    continue
+                try:
+                    file_date = date.fromisoformat(path.stem)
+                except ValueError as error:
+                    raise ValueError(
+                        f"Feiyou CSV filename must be YYYY-MM-DD: {path}"
+                    ) from error
+                if file_date in range_dates:
+                    by_date.setdefault(file_date, []).append(path)
+
+    expected = sorted(expected_dates)
+    #start = _date(start_date)
+    #end = _date(end_date)
+    # if end < start:
+    #     raise ValueError("Feiyou end_date must not be earlier than start_date")
+
+
+    
+    #     if start <= file_date <= end:
+    #         by_date.setdefault(file_date, []).append(path)
+
+    # expected = [
+    #     start + timedelta(days=offset) for offset in range((end - start).days + 1)
+    # ]
+        
     missing = [str(day) for day in expected if day not in by_date]
     duplicates = {
         str(day): [str(path) for path in paths]

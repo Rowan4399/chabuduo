@@ -2,8 +2,15 @@ name: beijing
 version: v1
 source:
   type: feiyou_csv
-  filename: 2025-07-28_2025-08-03.parquet
+  filename: 2025-2weeks.parquet
   pattern: "**/20??-??-??.csv"
-  start_date: 2025-07-28
-  end_date: 2025-08-03
+  
+  date_ranges:
+    - path: 北京20250728-20250803/北京20250728-20250803
+      start_date: 2025-07-28
+      end_date: 2025-08-03
+    - path: 北京20251215-20251221/北京20251215-20251221
+      start_date: 2025-12-15
+      end_date: 2025-12-21
+    
   chunk_rows: 250000
