@@ -1,7 +1,7 @@
 """The public command-line interface for the manual experiment workflow.
 
-This module is the project's front door. It defines the six supported stages
-(`get`, `preprocess`, `validate`, `train`, `sample`, and `plot`) and connects
+This module is the project's front door. It defines the supported stages
+(`get`, `preprocess`, `prepare`, `validate`, `train`, `sample`, and `plot`) and connects
 their command-line arguments to the corresponding implementation modules.
 
 Keep this file thin: argument parsing, default paths, and user-facing output
@@ -21,7 +21,8 @@ import typer
 from chabuduo.config import PROJECT_ROOT, config_path, load_config
 from chabuduo.get import resolve_traffic_dataset, stage_dataset
 from chabuduo.plotting import plot_samples
-from chabuduo.preprocess import prepare_dataset
+from chabuduo.prepare import prepare
+from chabuduo.preprocess import preprocess
 from chabuduo.sampling import sample_run
 from chabuduo.training import train_model
 from chabuduo.validate import ValidationError, validate_artifact
@@ -63,10 +64,7 @@ def preprocess_command(
     dataset: Annotated[
         str,
         typer.Argument(
-            help=(
-                "Bundled configuration: beijing, beijing_kinematic, "
-                "beijing_kinematic_circular, or zurich"
-            )
+            help="Bundled dataset configuration, for example beijing_feiyou or zurich"
         ),
     ],
     source: Annotated[
@@ -74,46 +72,63 @@ def preprocess_command(
         typer.Option(help="Staged raw Parquet file; omitted for traffic datasets"),
     ] = None,
     output: Annotated[
-        Path | None, typer.Option(help="Prepared artifact directory")
+        Path | None, typer.Option(help="Selected variable-length Traffic output")
     ] = None,
     config: Annotated[
         Path | None,
         typer.Option(help="Dataset YAML; defaults to the bundled dataset config"),
     ] = None,
     max_workers: Annotated[int, typer.Option(min=1)] = 1,
-    cache: Annotated[
-        Path | None,
-        typer.Option(help="Shared selected/resampled Traffic cache"),
-    ] = None,
 ) -> None:
-    """Select, resample, split, and normalize terminal trajectories."""
+    """Select variable-length terminal trajectories with Traffic."""
     configuration = load_config(config or config_path(dataset))
-    destination = (
-        output
-        or PROJECT_ROOT / "data" / "processed" / f"{dataset}-{configuration['version']}"
-    )
-    selection = configuration["selection"]
-    representation = configuration["representation"]
-    cache_path = cache or (
+    settings = configuration["preprocess"]
+    destination = output or (
         PROJECT_ROOT
         / "data"
         / "interim"
         / (
-            f"{selection['airport'].lower()}-{selection['radius_nm']}nm-"
-            f"{representation['points']}-points.parquet"
+            f"{settings['airport'].lower()}-{settings['operation']}-"
+            f"{settings['radius_nm']}nm.parquet"
         )
     )
     if source is None:
         if configuration["source"]["type"] != "traffic_dataset":
             raise typer.BadParameter("--source is required for local datasets")
         source = resolve_traffic_dataset(configuration["source"]["dataset"])
-    result = prepare_dataset(
+    preprocess(
         source,
-        destination,
         configuration,
         max_workers=max_workers,
-        cache=cache_path,
+        cache=destination,
     )
+    typer.echo(f"OUTPUT={destination}")
+
+
+@app.command("prepare")
+def prepare_command(
+    dataset: Annotated[str, typer.Argument(help="Dataset configuration name")],
+    selected: Annotated[
+        Path, typer.Option(help="Selected/resampled Traffic Parquet cache")
+    ],
+    output: Annotated[
+        Path | None, typer.Option(help="Serializable generation artifact directory")
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option(help="Dataset YAML; defaults to the bundled dataset config"),
+    ] = None,
+) -> None:
+    """Convert selected Traffic into a train-only-normalized model artifact."""
+    configuration = load_config(config or config_path(dataset))
+    destination = (
+        output
+        or PROJECT_ROOT
+        / "data"
+        / "processed"
+        / f"{dataset}-{configuration['version']}"
+    )
+    result = prepare(selected, destination, configuration)
     typer.echo(f"OUTPUT={result}")
 
 

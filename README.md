@@ -7,12 +7,12 @@ the artifacts, and makes failed generations visible.
 The workflow stays explicit:
 
 ```text
-get → preprocess → prepare-generation → validate → train → sample → plot
+get → preprocess → prepare → validate → train → sample → plot
 ```
 
 `get` only makes the raw Parquet source available. `preprocess` loads that file
 as a `traffic.core.Traffic` object, works with its individual `Flight` objects,
-and writes a selected/resampled Traffic cache. `prepare-generation` converts
+and writes a selected variable-length Traffic cache. `prepare` converts
 that cache into the fixed-shape numeric artifact used by the model. Each
 command reads an artifact, writes another artifact, and stops. This keeps
 the project understandable to a student and gives coding agents a stable
@@ -113,8 +113,8 @@ uv run chabuduo preprocess beijing_kinematic_circular \
   --source data/raw/beijing/2025-07-28.parquet \
   --max-workers 4
 
-uv run chabuduo prepare-generation beijing_kinematic_circular \
-  --selected data/interim/zbaa-40nm-200-points.parquet
+uv run chabuduo prepare beijing_kinematic_circular \
+  --selected data/interim/zbaa-landing-40nm.parquet
 
 uv run chabuduo validate \
   data/processed/beijing_kinematic_circular-v1
@@ -149,10 +149,10 @@ experiment parameter, not a substitute for checking prior/posterior mismatch.
 ### Shared preprocessing cache
 
 Landing detection, 40 NM cropping, and 200-point resampling are shared by all
-Beijing representations. Their reusable cache is:
+Beijing representations. Their reusable preprocessing cache is:
 
 ```text
-data/interim/zbaa-40nm-200-points.parquet
+data/interim/zbaa-landing-40nm.parquet
 ```
 
 Its YAML sidecar records the source hash and selection parameters. Changing the
@@ -171,7 +171,7 @@ uv run chabuduo get zurich
 
 uv run chabuduo preprocess zurich \
   --max-workers 4
-uv run chabuduo prepare-generation zurich \
+uv run chabuduo prepare zurich \
   --selected data/interim/lszh-40nm-200-points.parquet
 
 uv run chabuduo validate data/processed/zurich-v1

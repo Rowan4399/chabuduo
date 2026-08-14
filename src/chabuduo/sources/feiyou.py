@@ -41,6 +41,7 @@ MPS_TO_KNOTS = 1 / 0.5144444444444445
 MPS_TO_FEET_PER_MINUTE = 60 / 0.3048
 
 CONVERSION = {
+    "deduplication": "keep first observation per icao and position_time",
     "timestamp": "position_time milliseconds since epoch to UTC",
     "latitude": "lat degrees",
     "longitude": "lng degrees",
@@ -61,8 +62,6 @@ def discover_files(
     source: Path,
     *,
     pattern: str,
-    #start_date: date | str,
-    #end_date: date | str,
     date_ranges: list[tuple[Path, tuple[date | str, date | str]]],
 ) -> list[Path]:
     """Return exactly one chronologically ordered CSV for each requested day."""
@@ -71,12 +70,15 @@ def discover_files(
 
     expected_dates: set[date] = set()
     by_date: dict[date, list[Path]] = {}
-    for index, (relative_path, (start_value, end_value)) in enumerate(date_ranges, start=1):
-
+    for index, (relative_path, (start_value, end_value)) in enumerate(
+        date_ranges, start=1
+    ):
         start = _date(start_value)
         end = _date(end_value)
         if end < start:
-            raise ValueError(f"Feiyou date range {index} has end_date earlier than start_date")
+            raise ValueError(
+                f"Feiyou date range {index} has end_date earlier than start_date"
+            )
 
         directory = source / relative_path
         if not directory.is_dir():
@@ -88,7 +90,7 @@ def discover_files(
             start + timedelta(days=offset)
             for offset in range((end - start).days + 1)
         }
-        
+
         overlap = expected_dates & range_dates
         if overlap:
             raise ValueError(
@@ -100,32 +102,18 @@ def discover_files(
 
         candidates = sorted(directory.glob(pattern))
         for path in candidates:
-                if not path.is_file():
-                    continue
-                try:
-                    file_date = date.fromisoformat(path.stem)
-                except ValueError as error:
-                    raise ValueError(
-                        f"Feiyou CSV filename must be YYYY-MM-DD: {path}"
-                    ) from error
-                if file_date in range_dates:
-                    by_date.setdefault(file_date, []).append(path)
+            if not path.is_file():
+                continue
+            try:
+                file_date = date.fromisoformat(path.stem)
+            except ValueError as error:
+                raise ValueError(
+                    f"Feiyou CSV filename must be YYYY-MM-DD: {path}"
+                ) from error
+            if file_date in range_dates:
+                by_date.setdefault(file_date, []).append(path)
 
     expected = sorted(expected_dates)
-    #start = _date(start_date)
-    #end = _date(end_date)
-    # if end < start:
-    #     raise ValueError("Feiyou end_date must not be earlier than start_date")
-
-
-    
-    #     if start <= file_date <= end:
-    #         by_date.setdefault(file_date, []).append(path)
-
-    # expected = [
-    #     start + timedelta(days=offset) for offset in range((end - start).days + 1)
-    # ]
-        
     missing = [str(day) for day in expected if day not in by_date]
     duplicates = {
         str(day): [str(path) for path in paths]
@@ -140,6 +128,25 @@ def discover_files(
             details.append(f"duplicate dates: {duplicates}")
         raise ValueError("Invalid Feiyou source set; " + "; ".join(details))
     return [by_date[day][0] for day in expected]
+
+
+def _drop_duplicate_observations(
+    chunk: pd.DataFrame, seen: set[int]
+) -> tuple[pd.DataFrame, int]:
+    """Keep the first row for each aircraft timestamp in one daily file."""
+    addresses = pd.to_numeric(chunk["icao"], errors="raise").astype("int64")
+    if ((addresses < 0) | (addresses > 0xFFFFFF)).any():
+        raise ValueError("Feiyou icao values must fit in a 24-bit address")
+    timestamps = pd.to_numeric(
+        chunk["position_time"], errors="raise"
+    ).astype("int64")
+    keep: list[bool] = []
+    for address, timestamp in zip(addresses, timestamps, strict=True):
+        # ICAO addresses use 24 bits, so this packs both integers exactly.
+        key = (int(timestamp) << 24) | int(address)
+        keep.append(key not in seen)
+        seen.add(key)
+    return chunk.loc[keep], keep.count(False)
 
 
 def _convert_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
@@ -186,6 +193,9 @@ def convert_files(
         with pq.ParquetWriter(temporary, OUTPUT_SCHEMA, compression="snappy") as writer:
             for source in sources:
                 source_rows = 0
+                source_input_rows = 0
+                source_duplicates = 0
+                seen: set[int] = set()
                 chunks = pd.read_csv(
                     source,
                     usecols=SOURCE_COLUMNS,
@@ -193,6 +203,9 @@ def convert_files(
                     low_memory=False,
                 )
                 for chunk in chunks:
+                    source_input_rows += len(chunk)
+                    chunk, duplicates = _drop_duplicate_observations(chunk, seen)
+                    source_duplicates += duplicates
                     converted = _convert_chunk(chunk)
                     table = pa.Table.from_pandas(
                         converted,
@@ -204,7 +217,14 @@ def convert_files(
                     source_rows += len(converted)
                     total_rows += len(converted)
                     print(f"{total_rows:,} rows written", flush=True)
-                rows_by_source.append({"path": str(source), "rows": source_rows})
+                rows_by_source.append(
+                    {
+                        "path": str(source),
+                        "input_rows": source_input_rows,
+                        "rows": source_rows,
+                        "duplicates_removed": source_duplicates,
+                    }
+                )
         if total_rows == 0:
             raise ValueError("The Feiyou source files contain no observations")
         temporary.replace(destination)
@@ -212,4 +232,10 @@ def convert_files(
         temporary.unlink(missing_ok=True)
         raise
 
-    return {"rows": total_rows, "sources": rows_by_source}
+    return {
+        "rows": total_rows,
+        "duplicates_removed": sum(
+            item["duplicates_removed"] for item in rows_by_source
+        ),
+        "sources": rows_by_source,
+    }

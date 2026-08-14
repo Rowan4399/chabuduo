@@ -1,5 +1,147 @@
-"""Preprocessing stage placeholder."""
+"""Select terminal trajectories with the public ``traffic`` API.
+
+This stage keeps aviation meaning and variable-length trajectories. Here the
+configured radius is a simple approximation of the ASMA (Arrival Sequencing and
+Metering Area), the terminal area in which arriving flights are organised and
+sequenced toward the runway. For a landing, preprocessing keeps observations
+from entry into that radius up to the detected landing endpoint.
+
+中文说明：这里用机场周围的圆形半径近似 ASMA（进场排序与流量管理区域）。
+预处理保留飞机进入该区域后、直到检测到着陆终点的轨迹；这个圆形范围不是正式
+公布的空域边界。
+
+A later preparation stage handles duplicate timestamps, fixed-point resampling,
+features, splits, normalization, and model tensors.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pyarrow.parquet as pq
+from traffic.core import Flight, Traffic
+from traffic.data import airports
+
+from chabuduo.config import load_config, write_config
+from chabuduo.get import sha256
 
 
-def prepare_dataset(*args: object, **kwargs: object) -> object:
-    ...
+def _landing_in_asma(
+    flight: Flight,
+    *,
+    airport_code: str,
+    radius_nm: float,
+    max_threshold_distance_nm: float,
+    min_observations: int,
+    min_duration_sec: float,
+) -> Flight | None:
+    """Keep an ASMA arrival ending at an observed runway-threshold point."""
+    airport = airports[airport_code]
+
+    # Traffic detects runway-aligned landing segments. ILS_max is the runway
+    # designator inferred from the alignment, such as "36L" or "01".
+    landing = flight.landing(airport).next()
+    if landing is None or landing.ILS_max is None:
+        return None
+
+    # A physical runway has two named thresholds. Select the threshold whose
+    # name matches the detected landing direction.
+    runway_name = landing.ILS_max
+    runway = airport.runways[runway_name]
+    threshold = next(
+        point for point in runway.tuple_runway if point.name == runway_name
+    )
+
+    # Keep an observed receiver point rather than moving a point onto the
+    # runway. closest_point() reports metres, while the YAML tolerance is NM.
+    closest = flight.closest_point(threshold)
+    if closest.distance > max_threshold_distance_nm * 1852:
+        return None
+
+    # Include the closest observation, then retain only the part inside the
+    # circular ASMA approximation. Flight.distance(Airport) returns NM.
+    selected = flight.before(closest.timestamp, strict=False)
+    if selected is None:
+        return None
+    selected = selected.distance(airport).query(f"distance < {radius_nm}")
+    if selected is None:
+        return None
+    if len(selected.data) < min_observations:
+        return None
+    if selected.duration.total_seconds() < min_duration_sec:
+        return None
+    return selected
+
+
+def load_source_traffic(source: Path, config: dict[str, Any]) -> Traffic:
+    """Load a source Parquet as Traffic, using configured columns if present."""
+    source_columns = config["source"].get("columns")
+    if source_columns:
+        available = set(pq.ParquetFile(source).schema.names)
+        source_columns = [name for name in source_columns if name in available]
+    kwargs = {"columns": source_columns} if source_columns else {}
+    traffic = Traffic.from_file(source, **kwargs)
+    if traffic is None:
+        raise ValueError(f"Could not load Traffic from {source}")
+    return traffic
+
+
+def _cache_identity(source: Path, config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "artifact_type": "preprocessed_traffic",
+        "source_sha256": sha256(source),
+        "preprocess": config["preprocess"],
+    }
+
+
+def preprocess(
+    source: Path,
+    config: dict[str, Any],
+    *,
+    max_workers: int = 1,
+    cache: Path | None = None,
+) -> Traffic:
+    """Select variable-length terminal trajectories and optionally cache them."""
+    cache_manifest = cache.with_suffix(cache.suffix + ".yaml") if cache else None
+    identity = _cache_identity(source, config)
+    if cache and cache.exists() and cache_manifest and cache_manifest.exists():
+        if load_config(cache_manifest) == identity:
+            cached = Traffic.from_file(cache)
+            if cached is None:
+                raise ValueError(f"Could not load preprocessed Traffic: {cache}")
+            return cached
+
+    traffic = load_source_traffic(source, config)
+    if "flight_id" not in traffic.data.columns:
+        traffic = traffic.assign_id().eval(
+            max_workers=max_workers, desc="Assigning flight IDs"
+        )
+        if traffic is None:
+            raise ValueError("No trajectories found while assigning flight IDs")
+
+    settings = config["preprocess"]
+    operation = settings["operation"]
+    if operation != "landing":
+        raise ValueError(
+            f"Unsupported preprocess operation: {operation!r}; "
+            "takeoff will be added after its endpoint convention is tested"
+        )
+
+    result = traffic.pipe(
+        _landing_in_asma,
+        airport_code=settings["airport"],
+        radius_nm=float(settings["radius_nm"]),
+        max_threshold_distance_nm=float(settings["max_threshold_distance_nm"]),
+        min_observations=int(settings["min_observations"]),
+        min_duration_sec=float(settings["min_duration_sec"]),
+    ).eval(max_workers=max_workers, desc="Selecting terminal landings")
+    if result is None:
+        raise ValueError("Preprocessing selected no trajectories")
+
+    if cache and cache_manifest:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        result.to_parquet(cache)
+        write_config(identity, cache_manifest)
+    return result
+

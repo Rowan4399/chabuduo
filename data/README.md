@@ -10,7 +10,7 @@ ignored by Git because the Beijing source and derived arrays can be large.
 data/
 ├── raw/
 │   └── beijing/       # staged local Beijing Parquet source
-├── interim/           # selected/resampled Traffic Parquet caches
+├── interim/           # selected variable-length Traffic Parquet caches
 └── processed/         # immutable generation artifacts for model training
 ```
 
@@ -34,8 +34,8 @@ Continue the current single-day workflow with:
 ```bash
 uv run chabuduo preprocess beijing_kinematic_circular \
   --source data/raw/beijing/2025-07-28.parquet --max-workers 4
-uv run chabuduo prepare-generation beijing_kinematic_circular \
-  --selected data/interim/zbaa-40nm-200-points.parquet
+uv run chabuduo prepare beijing_kinematic_circular \
+  --selected data/interim/zbaa-landing-40nm.parquet
 uv run chabuduo validate data/processed/beijing_kinematic_circular-v1
 ```
 

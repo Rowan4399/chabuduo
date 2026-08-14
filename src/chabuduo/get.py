@@ -88,16 +88,16 @@ def stage_dataset(
             "source": str(source),
         }
     elif source_type == "feiyou_csv":
-        date_ranges = []
-        for date_range in source_config["date_ranges"]:
-            date_ranges.append((Path(date_range["path"]), 
-                                (date_range["start_date"], date_range["end_date"])))
-
+        date_ranges = [
+            (
+                Path(item["path"]),
+                (item["start_date"], item["end_date"]),
+            )
+            for item in source_config["date_ranges"]
+        ]
         sources = discover_files(
             source,
             pattern=source_config["pattern"],
-            #start_date=source_config["start_date"],
-            #end_date=source_config["end_date"],
             date_ranges=date_ranges,
         )
         conversion = convert_files(
@@ -105,28 +105,34 @@ def stage_dataset(
             output,
             chunk_rows=int(source_config.get("chunk_rows", 250_000)),
         )
-        source_rows = {item["path"]: item["rows"] for item in conversion["sources"]}
+        source_results = {
+            item["path"]: item for item in conversion["sources"]
+        }
         provenance = {
             "mode": "feiyou_csv_conversion",
             "source_root": str(source),
             "pattern": source_config["pattern"],
-            #"start_date": str(source_config["start_date"]),
-            #"end_date": str(source_config["end_date"]),
             "date_ranges": [
-                {"path": str(relative_path),
-                 "start_date": str(start_date),
-                 "end_date": str(end_date),
+                {
+                    "path": str(relative_path),
+                    "start_date": str(start_date),
+                    "end_date": str(end_date),
                 }
                 for relative_path, (start_date, end_date) in date_ranges
             ],
             "conversion": CONVERSION,
             "rows": conversion["rows"],
+            "duplicates_removed": conversion["duplicates_removed"],
             "sources": [
                 {
                     "file": str(path),
                     "bytes": path.stat().st_size,
                     "sha256": sha256(path),
-                    "rows": source_rows[str(path)],
+                    "input_rows": source_results[str(path)]["input_rows"],
+                    "rows": source_results[str(path)]["rows"],
+                    "duplicates_removed": source_results[str(path)][
+                        "duplicates_removed"
+                    ],
                 }
                 for path in sources
             ],
