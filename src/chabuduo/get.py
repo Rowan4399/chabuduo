@@ -20,9 +20,8 @@ from __future__ import annotations
 import hashlib
 import shutil
 from pathlib import Path
-from typing import Any
 
-from chabuduo.config import write_config
+from chabuduo.config import DatasetConfig, write_config
 from chabuduo.sources.feiyou import CONVERSION, convert_files, discover_files
 
 
@@ -57,22 +56,22 @@ def resolve_traffic_dataset(dataset_name: str) -> Path:
 
 
 def stage_dataset(
-    config: dict[str, Any],
+    config: DatasetConfig,
     output: Path,
     *,
     source: Path | None = None,
     force: bool = False,
 ) -> Path:
     """Resolve or stage one raw dataset without scientific preprocessing."""
-    source_config = config["source"]
-    source_type = source_config["type"]
+    source_config = config.source
+    source_type = source_config.type
 
     if source_type == "traffic_dataset":
         # The output argument is retained for a common CLI signature, but
         # traffic owns this cache and should not be copied into data/raw.
         if source is not None:
             raise ValueError("Traffic datasets do not accept --source")
-        return resolve_traffic_dataset(source_config["dataset"])
+        return resolve_traffic_dataset(source_config.dataset)
 
     _prepare_output(output, force)
     if source is None:
@@ -89,21 +88,18 @@ def stage_dataset(
         }
     elif source_type == "feiyou_csv":
         date_ranges = [
-            (
-                Path(item["path"]),
-                (item["start_date"], item["end_date"]),
-            )
-            for item in source_config["date_ranges"]
+            (item.path, (item.start_date, item.end_date))
+            for item in source_config.date_ranges
         ]
         sources = discover_files(
             source,
-            pattern=source_config["pattern"],
+            pattern=source_config.pattern,
             date_ranges=date_ranges,
         )
         conversion = convert_files(
             sources,
             output,
-            chunk_rows=int(source_config.get("chunk_rows", 250_000)),
+            chunk_rows=source_config.chunk_rows,
         )
         source_results = {
             item["path"]: item for item in conversion["sources"]
@@ -111,7 +107,7 @@ def stage_dataset(
         provenance = {
             "mode": "feiyou_csv_conversion",
             "source_root": str(source),
-            "pattern": source_config["pattern"],
+            "pattern": source_config.pattern,
             "date_ranges": [
                 {
                     "path": str(relative_path),
@@ -142,8 +138,8 @@ def stage_dataset(
 
     manifest = {
         "artifact_type": "raw_dataset",
-        "dataset": config["name"],
-        "version": config["version"],
+        "dataset": config.name,
+        "version": config.version,
         "file": output.name,
         "bytes": output.stat().st_size,
         "sha256": sha256(output),

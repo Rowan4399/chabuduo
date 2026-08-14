@@ -17,13 +17,12 @@ features, splits, normalization, and model tensors.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pyarrow.parquet as pq
 from traffic.core import Flight, Traffic
 from traffic.data import airports
 
-from chabuduo.config import load_config, write_config
+from chabuduo.config import DatasetConfig, load_config, write_config
 from chabuduo.get import sha256
 
 
@@ -74,9 +73,9 @@ def _landing_in_asma(
     return selected
 
 
-def load_source_traffic(source: Path, config: dict[str, Any]) -> Traffic:
+def load_source_traffic(source: Path, config: DatasetConfig) -> Traffic:
     """Load a source Parquet as Traffic, using configured columns if present."""
-    source_columns = config["source"].get("columns")
+    source_columns = getattr(config.source, "columns", None)
     if source_columns:
         available = set(pq.ParquetFile(source).schema.names)
         source_columns = [name for name in source_columns if name in available]
@@ -87,17 +86,17 @@ def load_source_traffic(source: Path, config: dict[str, Any]) -> Traffic:
     return traffic
 
 
-def _cache_identity(source: Path, config: dict[str, Any]) -> dict[str, Any]:
+def _cache_identity(source: Path, config: DatasetConfig) -> dict[str, object]:
     return {
         "artifact_type": "preprocessed_traffic",
         "source_sha256": sha256(source),
-        "preprocess": config["preprocess"],
+        "preprocess": config.preprocess.model_dump(mode="json"),
     }
 
 
 def preprocess(
     source: Path,
-    config: dict[str, Any],
+    config: DatasetConfig,
     *,
     max_workers: int = 1,
     cache: Path | None = None,
@@ -120,8 +119,8 @@ def preprocess(
         if traffic is None:
             raise ValueError("No trajectories found while assigning flight IDs")
 
-    settings = config["preprocess"]
-    operation = settings["operation"]
+    settings = config.preprocess
+    operation = settings.operation
     if operation != "landing":
         raise ValueError(
             f"Unsupported preprocess operation: {operation!r}; "
@@ -130,11 +129,11 @@ def preprocess(
 
     result = traffic.pipe(
         _landing_in_asma,
-        airport_code=settings["airport"],
-        radius_nm=float(settings["radius_nm"]),
-        max_threshold_distance_nm=float(settings["max_threshold_distance_nm"]),
-        min_observations=int(settings["min_observations"]),
-        min_duration_sec=float(settings["min_duration_sec"]),
+        airport_code=settings.airport,
+        radius_nm=settings.radius_nm,
+        max_threshold_distance_nm=settings.max_threshold_distance_nm,
+        min_observations=settings.min_observations,
+        min_duration_sec=settings.min_duration_sec,
     ).eval(max_workers=max_workers, desc="Selecting terminal landings")
     if result is None:
         raise ValueError("Preprocessing selected no trajectories")

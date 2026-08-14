@@ -18,7 +18,13 @@ from typing import Annotated
 
 import typer
 
-from chabuduo.config import PROJECT_ROOT, config_path, load_config
+from chabuduo.config import (
+    PROJECT_ROOT,
+    DatasetConfig,
+    config_path,
+    load_config,
+    load_dataset_config,
+)
 from chabuduo.get import resolve_traffic_dataset, stage_dataset
 from chabuduo.plotting import plot_samples
 from chabuduo.prepare import prepare
@@ -32,6 +38,13 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Run aircraft trajectory generation experiments one stage at a time.",
 )
+
+
+def _dataset_config(dataset: str, path: Path | None) -> DatasetConfig:
+    try:
+        return load_dataset_config(path or config_path(dataset))
+    except ValueError as error:
+        raise typer.BadParameter(f"Invalid dataset configuration: {error}") from error
 
 
 @app.command("get")
@@ -49,12 +62,12 @@ def get_command(
     force: Annotated[bool, typer.Option(help="Replace an existing raw file")] = False,
 ) -> None:
     """Stage raw data; do not preprocess it."""
-    configuration = load_config(config or config_path(dataset))
-    filename = configuration["source"]["filename"]
+    configuration = _dataset_config(dataset, config)
+    filename = configuration.source.filename
     destination = output or PROJECT_ROOT / "data" / "raw" / dataset / filename
     result = stage_dataset(configuration, destination, source=source, force=force)
     label = (
-        "SOURCE" if configuration["source"]["type"] == "traffic_dataset" else "OUTPUT"
+        "SOURCE" if configuration.source.type == "traffic_dataset" else "OUTPUT"
     )
     typer.echo(f"{label}={result}")
 
@@ -81,21 +94,21 @@ def preprocess_command(
     max_workers: Annotated[int, typer.Option(min=1)] = 1,
 ) -> None:
     """Select variable-length terminal trajectories with Traffic."""
-    configuration = load_config(config or config_path(dataset))
-    settings = configuration["preprocess"]
+    configuration = _dataset_config(dataset, config)
+    settings = configuration.preprocess
     destination = output or (
         PROJECT_ROOT
         / "data"
         / "interim"
         / (
-            f"{settings['airport'].lower()}-{settings['operation']}-"
-            f"{settings['radius_nm']}nm.parquet"
+            f"{settings.airport.lower()}-{settings.operation}-"
+            f"{settings.radius_nm:g}nm.parquet"
         )
     )
     if source is None:
-        if configuration["source"]["type"] != "traffic_dataset":
+        if configuration.source.type != "traffic_dataset":
             raise typer.BadParameter("--source is required for local datasets")
-        source = resolve_traffic_dataset(configuration["source"]["dataset"])
+        source = resolve_traffic_dataset(configuration.source.dataset)
     preprocess(
         source,
         configuration,
@@ -120,13 +133,13 @@ def prepare_command(
     ] = None,
 ) -> None:
     """Convert selected Traffic into a train-only-normalized model artifact."""
-    configuration = load_config(config or config_path(dataset))
+    configuration = _dataset_config(dataset, config)
     destination = (
         output
         or PROJECT_ROOT
         / "data"
         / "processed"
-        / f"{dataset}-{configuration['version']}"
+        / f"{dataset}-{configuration.version}"
     )
     result = prepare(selected, destination, configuration)
     typer.echo(f"OUTPUT={result}")
