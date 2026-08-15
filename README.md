@@ -213,8 +213,10 @@ The current task is to evaluate the circular-track TCVAE run by comparing:
 
 If prior generations remain poor, the next decision is not “train longer.” The
 likely choices are conditioning by runway/flow or changing the latent prior.
-DDPM, flow matching, VampPrior, and a full evaluation registry remain future
-work.
+Conditional DDPM training and sampling are available, but preparation still
+needs the `model_condition_id` flow labels. DDPM sampling balances the requested
+total sample count across the condition IDs present in the training split.
+Flow matching, VampPrior, and a full evaluation registry remain future work.
 
 ## Tests
 

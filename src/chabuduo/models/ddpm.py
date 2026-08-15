@@ -356,6 +356,41 @@ class ConditionalDDPM(nn.Module):
         return generated.cpu().numpy()
 
 
+def sample_ddpm(
+    checkpoint: Path,
+    condition_ids: np.ndarray,
+    sequence_length: int,
+    *,
+    steps: int,
+    eta: float,
+) -> np.ndarray:
+    """Load a DDPM checkpoint and return normalized ``[N, T, F]`` values."""
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    model = ConditionalDDPM(
+        feature_dim=int(state["feature_dim"]),
+        hidden_dim=int(state["hidden_dim"]),
+        num_layers=int(state["num_layers"]),
+        condition_count=int(state["condition_count"]),
+        diffusion_steps=int(state["diffusion_steps"]),
+    )
+    model.load_state_dict(state["model_state_dict"])
+    model.eval()
+    result = np.empty(
+        (len(condition_ids), sequence_length, model.denoiser.feature_dim),
+        dtype=np.float32,
+    )
+    for condition_id in np.unique(condition_ids):
+        rows = np.flatnonzero(condition_ids == condition_id)
+        result[rows] = model.sample(
+            len(rows),
+            int(condition_id),
+            sequence_length,
+            steps=steps,
+            eta=eta,
+        )
+    return result
+
+
 def _conditions(
     metadata: pd.DataFrame,
     data: SplitData,
@@ -425,7 +460,7 @@ def train_ddpm(
         else 1
     )
     hidden_dim = 64 if smoke else config.model.hidden_channels
-    diffusion_steps = 20 if smoke else config.model.diffusion_steps
+    diffusion_steps = config.model.diffusion_steps
     model = ConditionalDDPM(
         feature_dim,
         hidden_dim,

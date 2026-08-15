@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import lightning as L
+import numpy as np
 import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
@@ -314,6 +315,24 @@ def _loader(
         shuffle=shuffle,
         num_workers=workers,
         persistent_workers=workers > 0,
+    )
+
+
+def sample_tcvae(
+    checkpoint: Path,
+    count: int,
+    *,
+    temperature: float,
+) -> np.ndarray:
+    """Load a TCVAE checkpoint and return normalized ``[N, T, F]`` values."""
+    module = TCVAELightning.load_from_checkpoint(checkpoint, map_location="cpu")
+    module.eval()
+    return (
+        module.generate(count, temperature=temperature)
+        .permute(0, 2, 1)
+        .cpu()
+        .numpy()
+        .astype(np.float32)
     )
 
 
