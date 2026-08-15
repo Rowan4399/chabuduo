@@ -22,7 +22,7 @@ from chabuduo.plotting import plot_samples
 from chabuduo.prepare import prepare
 from chabuduo.preprocess import preprocess
 from chabuduo.sampling import sample_run
-from chabuduo.training import train_model
+from chabuduo.train import train
 from chabuduo.validate import ValidationError, validate_artifact
 
 app = typer.Typer(
@@ -149,7 +149,7 @@ def train_command(
 ) -> None:
     """Train the model selected by the experiment configuration."""
     configuration = _experiment_config(experiment, config)
-    result = train_model(
+    result = train(
         artifact or prepared_path(configuration),
         output or run_path(configuration, smoke=smoke),
         configuration,

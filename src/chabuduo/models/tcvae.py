@@ -8,11 +8,20 @@ Terminal Maneuvering Areas", DOI 10.24433/CO.0357574.V1. See NOTICE.md.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
+import lightning as L
 import torch
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.utils.parametrizations import weight_norm
+from torch.utils.data import DataLoader, TensorDataset
+
+from chabuduo.artifacts import SplitData
+from chabuduo.config import ExperimentConfig
 
 
 class CausalTemporalBlock(nn.Module):
@@ -221,3 +230,169 @@ class StandardTCVAE(nn.Module):
         target_device = device or parameter.device
         latent = temperature * torch.randn(count, self.latent_dim, device=target_device)
         return self.decode(latent)
+
+
+class TCVAELightning(L.LightningModule):
+    """Lightning adapter for the TCVAE loss and optimizer."""
+
+    def __init__(self, resolved_config: dict[str, Any]) -> None:
+        super().__init__()
+        self.save_hyperparameters({"resolved_config": resolved_config})
+        self.resolved_config = resolved_config
+        model = resolved_config["model"]
+        self.network = StandardTCVAE(
+            input_channels=int(model["input_channels"]),
+            sequence_length=int(model["sequence_length"]),
+            hidden_channels=model["hidden_channels"],
+            latent_dim=int(model["latent_dim"]),
+            kernel_size=int(model["kernel_size"]),
+            dilation_base=int(model["dilation_base"]),
+            sampling_factor=int(model["sampling_factor"]),
+            dropout=float(model["dropout"]),
+        )
+        loss_config = resolved_config["loss"]
+        initial_scale = torch.tensor(float(loss_config.get("decoder_scale", 1.0)))
+        self.log_decoder_scale = torch.nn.Parameter(
+            initial_scale.log(),
+            requires_grad=bool(loss_config.get("learn_decoder_scale", True)),
+        )
+
+    def compute_loss(self, value: Tensor) -> dict[str, Tensor]:
+        reconstruction, mean, log_variance = self.network(value)
+        log_scale = self.log_decoder_scale.clamp_min(-9.21034)
+        scale = log_scale.exp()
+        gaussian_nll = (
+            0.5 * ((value - reconstruction) / scale).square()
+            + log_scale
+            + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=value.device))
+        )
+        reconstruction_loss = gaussian_nll.sum(dim=(1, 2)).mean()
+        kl_loss = self.network.kl_divergence(mean, log_variance)
+        loss_config = self.resolved_config["loss"]
+        loss = (
+            float(loss_config["reconstruction_weight"]) * reconstruction_loss
+            + float(loss_config["kl_weight"]) * kl_loss
+        )
+        return {"loss": loss, "reconstruction": reconstruction_loss, "kl": kl_loss}
+
+    def _shared_step(self, batch: tuple[Tensor], prefix: str) -> Tensor:
+        value = batch[0].permute(0, 2, 1)
+        losses = self.compute_loss(value)
+        self.log_dict(
+            {f"{prefix}/{name}": item for name, item in losses.items()},
+            on_epoch=True,
+            prog_bar=prefix == "validation",
+            batch_size=value.shape[0],
+        )
+        return losses["loss"]
+
+    def training_step(self, batch: tuple[Tensor], batch_index: int) -> Tensor:
+        return self._shared_step(batch, "train")
+
+    def validation_step(self, batch: tuple[Tensor], batch_index: int) -> Tensor:
+        return self._shared_step(batch, "validation")
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        optimizer = self.resolved_config["optimizer"]
+        return torch.optim.Adam(
+            self.parameters(),
+            lr=float(optimizer["learning_rate"]),
+            weight_decay=float(optimizer.get("weight_decay", 0)),
+        )
+
+    @torch.inference_mode()
+    def generate(self, count: int, *, temperature: float = 1.0) -> Tensor:
+        return self.network.sample(count, device=self.device, temperature=temperature)
+
+
+def _loader(
+    data: SplitData, batch_size: int, workers: int, shuffle: bool
+) -> DataLoader:
+    return DataLoader(
+        TensorDataset(torch.from_numpy(data.values)),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=workers,
+        persistent_workers=workers > 0,
+    )
+
+
+def train_tcvae(
+    artifact: Path,
+    output: Path,
+    config: ExperimentConfig,
+    *,
+    smoke: bool,
+) -> Path:
+    """Train a TCVAE from the ready arrays in a prepared artifact."""
+    if config.model.type != "tcvae":
+        raise TypeError("train_tcvae requires model.type=tcvae")
+    train_data = SplitData.load(artifact / "train.npz")
+    validation_data = SplitData.load(artifact / "validation.npz")
+    sequence_length, input_channels = train_data.values.shape[1:]
+    resolved = {
+        "name": config.name,
+        "model": {
+            **config.model.model_dump(exclude={"type", "loss"}),
+            "input_channels": input_channels,
+            "sequence_length": sequence_length,
+        },
+        "loss": config.model.loss.model_dump(),
+        "optimizer": config.optimizer.model_dump(),
+        "training": config.training.model_dump(),
+        "seed": config.training.seed,
+        "smoke": smoke,
+    }
+    if smoke:
+        resolved["model"] = {
+            **resolved["model"],
+            "hidden_channels": [8, 8],
+            "latent_dim": 4,
+            "kernel_size": 3,
+            "dropout": 0.0,
+        }
+        resolved["training"] = {
+            **resolved["training"],
+            "batch_size": 8,
+            "max_epochs": 1,
+            "num_workers": 0,
+            "accelerator": "cpu",
+            "devices": 1,
+        }
+
+    training = resolved["training"]
+    checkpoint = ModelCheckpoint(
+        dirpath=output / "checkpoints",
+        filename="best",
+        monitor="validation/loss",
+        mode="min",
+        save_last=True,
+    )
+    trainer = L.Trainer(
+        max_epochs=int(training["max_epochs"]),
+        accelerator=training.get("accelerator", "auto"),
+        devices=training.get("devices", 1),
+        callbacks=[checkpoint],
+        logger=CSVLogger(save_dir=output / "logs", name="training"),
+        deterministic=True,
+        enable_autolog_hparams=False,
+        enable_progress_bar=True,
+        limit_train_batches=1 if smoke else 1.0,
+        limit_val_batches=1 if smoke else 1.0,
+    )
+    trainer.fit(
+        TCVAELightning(resolved),
+        train_dataloaders=_loader(
+            train_data,
+            int(training["batch_size"]),
+            int(training["num_workers"]),
+            True,
+        ),
+        val_dataloaders=_loader(
+            validation_data,
+            int(training["batch_size"]),
+            int(training["num_workers"]),
+            False,
+        ),
+    )
+    return output
