@@ -22,8 +22,7 @@ import pyarrow.parquet as pq
 from traffic.core import Flight, Traffic
 from traffic.data import airports
 
-from chabuduo.config import DatasetConfig, load_config, write_config
-from chabuduo.get import sha256
+from chabuduo.config import ExperimentConfig
 
 
 def _landing_in_asma(
@@ -73,52 +72,34 @@ def _landing_in_asma(
     return selected
 
 
-def load_source_traffic(source: Path, config: DatasetConfig) -> Traffic:
+def load_source_traffic(source: Path, config: ExperimentConfig) -> Traffic:
     """Load a source Parquet as Traffic, using configured columns if present."""
     source_columns = getattr(config.source, "columns", None)
     if source_columns:
         available = set(pq.ParquetFile(source).schema.names)
         source_columns = [name for name in source_columns if name in available]
     kwargs = {"columns": source_columns} if source_columns else {}
-    traffic = Traffic.from_file(source, **kwargs)
-    if traffic is None:
+    t = Traffic.from_file(source, **kwargs)
+    if t is None:
         raise ValueError(f"Could not load Traffic from {source}")
-    return traffic
-
-
-def _cache_identity(source: Path, config: DatasetConfig) -> dict[str, object]:
-    return {
-        "artifact_type": "preprocessed_traffic",
-        "source_sha256": sha256(source),
-        "preprocess": config.preprocess.model_dump(mode="json"),
-    }
+    return t
 
 
 def preprocess(
     source: Path,
-    config: DatasetConfig,
+    config: ExperimentConfig,
     *,
     max_workers: int = 1,
     cache: Path | None = None,
 ) -> Traffic:
     """Select variable-length terminal trajectories and optionally cache them."""
-    cache_manifest = cache.with_suffix(cache.suffix + ".yaml") if cache else None
-    identity = _cache_identity(source, config)
-    if cache and cache.exists() and cache_manifest and cache_manifest.exists():
-        if load_config(cache_manifest) == identity:
-            cached = Traffic.from_file(cache)
-            if cached is None:
-                raise ValueError(f"Could not load preprocessed Traffic: {cache}")
-            return cached
+    if cache and cache.exists():
+        t = Traffic.from_file(cache)
+        if t is None:
+            raise ValueError(f"Could not load preprocessed Traffic: {cache}")
+        return t
 
-    traffic = load_source_traffic(source, config)
-    if "flight_id" not in traffic.data.columns:
-        traffic = traffic.assign_id().eval(
-            max_workers=max_workers, desc="Assigning flight IDs"
-        )
-        if traffic is None:
-            raise ValueError("No trajectories found while assigning flight IDs")
-
+    t = load_source_traffic(source, config)
     settings = config.preprocess
     operation = settings.operation
     if operation != "landing":
@@ -127,7 +108,7 @@ def preprocess(
             "takeoff will be added after its endpoint convention is tested"
         )
 
-    result = traffic.pipe(
+    res = t.assign_id().pipe(
         _landing_in_asma,
         airport_code=settings.airport,
         radius_nm=settings.radius_nm,
@@ -135,12 +116,11 @@ def preprocess(
         min_observations=settings.min_observations,
         min_duration_sec=settings.min_duration_sec,
     ).eval(max_workers=max_workers, desc="Selecting terminal landings")
-    if result is None:
+    if res is None:
         raise ValueError("Preprocessing selected no trajectories")
 
-    if cache and cache_manifest:
+    if cache:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        result.to_parquet(cache)
-        write_config(identity, cache_manifest)
-    return result
+        res.to_parquet(cache)
+    return res
 

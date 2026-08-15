@@ -1,15 +1,4 @@
-"""The public command-line interface for the manual experiment workflow.
-
-This module is the project's front door. It defines the supported stages
-(`get`, `preprocess`, `prepare`, `validate`, `train`, `sample`, and `plot`) and connects
-their command-line arguments to the corresponding implementation modules.
-
-Keep this file thin: argument parsing, default paths, and user-facing output
-belong here; data processing, model code, training, and artifact writing belong
-in their own modules. Each command should consume an existing artifact, write
-one next artifact, print its path, and stop. This deliberate separation makes
-experiments understandable and lets a student run or debug one stage at a time.
-"""
+"""Public CLI for running one configured experiment one stage at a time."""
 
 from __future__ import annotations
 
@@ -19,11 +8,14 @@ from typing import Annotated
 import typer
 
 from chabuduo.config import (
-    PROJECT_ROOT,
-    DatasetConfig,
+    ExperimentConfig,
     config_path,
-    load_config,
-    load_dataset_config,
+    load_experiment_config,
+    prepared_path,
+    raw_path,
+    run_path,
+    sample_path,
+    selected_path,
 )
 from chabuduo.get import resolve_traffic_dataset, stage_dataset
 from chabuduo.plotting import plot_samples
@@ -36,79 +28,62 @@ from chabuduo.validate import ValidationError, validate_artifact
 app = typer.Typer(
     name="chabuduo",
     no_args_is_help=True,
-    help="Run aircraft trajectory generation experiments one stage at a time.",
+    help="Run one configured trajectory experiment one stage at a time.",
 )
 
 
-def _dataset_config(dataset: str, path: Path | None) -> DatasetConfig:
+def _experiment_config(experiment: str, path: Path | None) -> ExperimentConfig:
     try:
-        return load_dataset_config(path or config_path(dataset))
+        return load_experiment_config(path or config_path(experiment))
     except ValueError as error:
-        raise typer.BadParameter(f"Invalid dataset configuration: {error}") from error
+        raise typer.BadParameter(
+            f"Invalid experiment configuration: {error}"
+        ) from error
+
+
+ConfigOption = Annotated[
+    Path | None,
+    typer.Option(help="Experiment YAML; defaults to the bundled configuration"),
+]
 
 
 @app.command("get")
 def get_command(
-    dataset: Annotated[str, typer.Argument(help="Dataset name: beijing or zurich")],
+    experiment: Annotated[str, typer.Argument(help="Experiment configuration name")],
     source: Annotated[
         Path | None,
         typer.Option(help="Existing source file or provider directory"),
     ] = None,
     output: Annotated[Path | None, typer.Option(help="Raw Parquet output path")] = None,
-    config: Annotated[
-        Path | None,
-        typer.Option(help="Dataset YAML; defaults to the bundled dataset config"),
-    ] = None,
+    config: ConfigOption = None,
     force: Annotated[bool, typer.Option(help="Replace an existing raw file")] = False,
 ) -> None:
     """Stage raw data; do not preprocess it."""
-    configuration = _dataset_config(dataset, config)
-    filename = configuration.source.filename
-    destination = output or PROJECT_ROOT / "data" / "raw" / dataset / filename
+    configuration = _experiment_config(experiment, config)
+    destination = output or raw_path(configuration)
     result = stage_dataset(configuration, destination, source=source, force=force)
-    label = (
-        "SOURCE" if configuration.source.type == "traffic_dataset" else "OUTPUT"
-    )
+    label = "SOURCE" if configuration.source.type == "traffic_dataset" else "OUTPUT"
     typer.echo(f"{label}={result}")
 
 
 @app.command("preprocess")
 def preprocess_command(
-    dataset: Annotated[
-        str,
-        typer.Argument(
-            help="Bundled dataset configuration, for example beijing_feiyou or zurich"
-        ),
-    ],
-    source: Annotated[
-        Path | None,
-        typer.Option(help="Staged raw Parquet file; omitted for traffic datasets"),
-    ] = None,
+    experiment: Annotated[str, typer.Argument(help="Experiment configuration name")],
+    source: Annotated[Path | None, typer.Option(help="Raw Parquet input")] = None,
     output: Annotated[
         Path | None, typer.Option(help="Selected variable-length Traffic output")
     ] = None,
-    config: Annotated[
-        Path | None,
-        typer.Option(help="Dataset YAML; defaults to the bundled dataset config"),
-    ] = None,
+    config: ConfigOption = None,
     max_workers: Annotated[int, typer.Option(min=1)] = 1,
 ) -> None:
     """Select variable-length terminal trajectories with Traffic."""
-    configuration = _dataset_config(dataset, config)
-    settings = configuration.preprocess
-    destination = output or (
-        PROJECT_ROOT
-        / "data"
-        / "interim"
-        / (
-            f"{settings.airport.lower()}-{settings.operation}-"
-            f"{settings.radius_nm:g}nm.parquet"
-        )
-    )
+    configuration = _experiment_config(experiment, config)
     if source is None:
-        if configuration.source.type != "traffic_dataset":
-            raise typer.BadParameter("--source is required for local datasets")
-        source = resolve_traffic_dataset(configuration.source.dataset)
+        if configuration.source.type == "traffic_dataset":
+            source = resolve_traffic_dataset(configuration.source.dataset)
+        else:
+            source = raw_path(configuration)
+    destination = output or selected_path(configuration)
     preprocess(
         source,
         configuration,
@@ -120,38 +95,39 @@ def preprocess_command(
 
 @app.command("prepare")
 def prepare_command(
-    dataset: Annotated[str, typer.Argument(help="Dataset configuration name")],
+    experiment: Annotated[str, typer.Argument(help="Experiment configuration name")],
     selected: Annotated[
-        Path, typer.Option(help="Selected/resampled Traffic Parquet cache")
-    ],
+        Path | None, typer.Option(help="Selected variable-length Traffic input")
+    ] = None,
     output: Annotated[
-        Path | None, typer.Option(help="Serializable generation artifact directory")
+        Path | None, typer.Option(help="Ready-to-train tensor directory")
     ] = None,
-    config: Annotated[
-        Path | None,
-        typer.Option(help="Dataset YAML; defaults to the bundled dataset config"),
-    ] = None,
+    config: ConfigOption = None,
 ) -> None:
-    """Convert selected Traffic into a train-only-normalized model artifact."""
-    configuration = _dataset_config(dataset, config)
-    destination = (
-        output
-        or PROJECT_ROOT
-        / "data"
-        / "processed"
-        / f"{dataset}-{configuration.version}"
+    """Create split, normalized, ready-to-train numerical tensors."""
+    configuration = _experiment_config(experiment, config)
+    result = prepare(
+        selected or selected_path(configuration),
+        output or prepared_path(configuration),
+        configuration,
     )
-    result = prepare(selected, destination, configuration)
     typer.echo(f"OUTPUT={result}")
 
 
 @app.command("validate")
 def validate_command(
-    artifact: Annotated[Path, typer.Argument(help="Prepared artifact directory")],
+    experiment: Annotated[str, typer.Argument(help="Experiment configuration name")],
+    artifact: Annotated[
+        Path | None, typer.Option(help="Prepared tensor directory")
+    ] = None,
+    config: ConfigOption = None,
 ) -> None:
-    """Check whether a prepared dataset is safe for training."""
+    """Check whether prepared tensors are safe for training."""
+    configuration = _experiment_config(experiment, config)
     try:
-        messages = validate_artifact(artifact)
+        messages = validate_artifact(
+            artifact or prepared_path(configuration), configuration
+        )
     except ValidationError as error:
         typer.echo(f"ERROR: {error}", err=True)
         raise typer.Exit(code=1) from error
@@ -161,60 +137,72 @@ def validate_command(
 
 @app.command("train")
 def train_command(
-    artifact: Annotated[Path, typer.Argument(help="Prepared artifact directory")],
-    config: Annotated[
-        Path | None,
-        typer.Option(help="Model YAML; defaults to the bundled TCVAE config"),
+    experiment: Annotated[str, typer.Argument(help="Experiment configuration name")],
+    artifact: Annotated[
+        Path | None, typer.Option(help="Prepared tensor directory")
     ] = None,
     output: Annotated[Path | None, typer.Option(help="Run output directory")] = None,
-    seed: Annotated[int, typer.Option()] = 42,
+    config: ConfigOption = None,
     smoke: Annotated[
         bool, typer.Option(help="Run one tiny CPU epoch to test the complete path")
     ] = False,
 ) -> None:
-    """Train the standard-prior temporal convolutional VAE."""
-    model_config = load_config(config or config_path("tcvae"))
-    destination = (
-        output
-        or PROJECT_ROOT
-        / "runs"
-        / f"{artifact.name}-tcvae-seed-{seed}{'-smoke' if smoke else ''}"
+    """Train the model selected by the experiment configuration."""
+    configuration = _experiment_config(experiment, config)
+    result = train_model(
+        artifact or prepared_path(configuration),
+        output or run_path(configuration, smoke=smoke),
+        configuration,
+        smoke=smoke,
     )
-    result = train_model(artifact, destination, model_config, seed=seed, smoke=smoke)
     typer.echo(f"RUN={result}")
 
 
 @app.command("sample")
 def sample_command(
-    run: Annotated[Path, typer.Argument(help="Completed training run directory")],
-    count: Annotated[int, typer.Option(min=1)] = 100,
-    seed: Annotated[int, typer.Option()] = 42,
-    output: Annotated[
-        Path | None, typer.Option(help="Generated sample artifact directory")
+    experiment: Annotated[str, typer.Argument(help="Experiment configuration name")],
+    run: Annotated[Path | None, typer.Option(help="Training run directory")] = None,
+    artifact: Annotated[
+        Path | None, typer.Option(help="Prepared tensor directory")
     ] = None,
-    temperature: Annotated[
-        float,
-        typer.Option(min=0.05, max=2.0, help="Latent prior temperature"),
-    ] = 1.0,
+    output: Annotated[
+        Path | None, typer.Option(help="Generated sample directory")
+    ] = None,
+    config: ConfigOption = None,
 ) -> None:
-    """Generate canonical tensors and a Traffic-compatible Parquet table."""
+    """Generate tensors and a Traffic-compatible Parquet table."""
+    configuration = _experiment_config(experiment, config)
+    run_directory = run or run_path(configuration)
     result = sample_run(
-        run,
-        count=count,
-        seed=seed,
-        output=output,
-        temperature=temperature,
+        run_directory,
+        artifact or prepared_path(configuration),
+        configuration,
+        output=output or sample_path(configuration, run_directory),
     )
     typer.echo(f"OUTPUT={result}")
 
 
 @app.command("plot")
 def plot_command(
-    sample: Annotated[Path, typer.Argument(help="Generated sample directory")],
+    experiment: Annotated[str, typer.Argument(help="Experiment configuration name")],
+    sample: Annotated[
+        Path | None, typer.Option(help="Generated sample directory")
+    ] = None,
+    artifact: Annotated[
+        Path | None, typer.Option(help="Prepared tensor directory")
+    ] = None,
     output: Annotated[Path | None, typer.Option(help="PNG output path")] = None,
+    config: ConfigOption = None,
 ) -> None:
-    """Plot held-out and generated trajectories in the dataset's local frame."""
-    result = plot_samples(sample, output=output)
+    """Plot held-out and generated trajectories in the local frame."""
+    configuration = _experiment_config(experiment, config)
+    run_directory = run_path(configuration)
+    result = plot_samples(
+        sample or sample_path(configuration, run_directory),
+        artifact or prepared_path(configuration),
+        configuration,
+        output=output,
+    )
     typer.echo(f"OUTPUT={result}")
 
 

@@ -1,0 +1,69 @@
+name: zurich_ddpm
+dataset: zurich
+version: v1
+
+source:
+  type: traffic_dataset
+  dataset: landing_zurich_2019
+  filename: landing_zurich_2019.parquet
+
+preprocess:
+  operation: landing
+  airport: LSZH
+  radius_nm: 40
+  max_threshold_distance_nm: 0.1
+  min_observations: 10
+  min_duration_sec: 600
+
+prepare:
+  points: 200
+  representation:
+    name: kinematic_200
+    features: [track_unwrapped, groundspeed_kt, altitude_ft, elapsed_time_sec]
+    units: [degree, knot, ft, s]
+    direction: chronological
+    anchor: airport
+  split:
+    group_by: flight_id
+    train: 0.70
+    validation: 0.15
+    test: 0.15
+    seed: 42
+  normalization:
+    method: standard_per_timestep
+    fit_on: train
+
+model:
+  type: ddpm
+  architecture: dual_branch_1d_unet
+  hidden_channels: 128
+  num_layers: 4
+  diffusion_steps: 1000
+  prediction: noise
+  conditioning:
+    feature: model_condition_id
+
+optimizer:
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+
+training:
+  seed: 42
+  batch_size: 32
+  max_epochs: 1000
+  num_workers: 0
+  accelerator: auto
+  devices: 1
+  gradient_clip_norm: 1.0
+  mixed_precision: true
+
+sampling:
+  type: ddpm
+  count: 100
+  seed: 42
+  steps: 100
+  eta: 0.0
+  minimum_groundspeed_kt: 30.0
+  maximum_groundspeed_kt: 600.0
+  minimum_altitude_ft: -1000.0
+  maximum_altitude_ft: 45000.0

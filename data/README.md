@@ -1,48 +1,45 @@
-# Local data
+# Data artifacts
 
-This directory is created and filled by the manual project workflow. The files
-are local experiment inputs and prepared artifacts; they are intentionally
-ignored by Git because the Beijing source and derived arrays can be large.
-
-## Layout
+The committed experiment YAML is the only configuration file. Data directories
+contain files produced by one explicit CLI stage.
 
 ```text
 data/
-├── raw/
-│   └── beijing/       # staged local Beijing Parquet source
-├── interim/           # selected variable-length Traffic Parquet caches
-└── processed/         # immutable generation artifacts for model training
+├── raw/        # staged source Parquet
+├── interim/    # selected variable-length Traffic
+└── processed/  # ready-to-train tensors
 ```
 
-Stage an existing Beijing Parquet, or convert the configured week of Feiyou
-CSV files:
+## Beijing
 
 ```bash
-uv run chabuduo get beijing --source ../2025-07-28.parquet
-uv run chabuduo get beijing \
-  --config src/chabuduo/configs/beijing_feiyou.yaml \
-  --source /path/to/北京20250728-20250803
+uv run chabuduo get beijing_tcvae --source /path/to/feiyou-root
+uv run chabuduo preprocess beijing_tcvae --max-workers 4
+uv run chabuduo prepare beijing_tcvae
+uv run chabuduo validate beijing_tcvae
 ```
 
-The second command writes
-`data/raw/beijing/2025-07-28_2025-08-03.parquet`. Use a period-specific interim
-cache and processed artifact for that source rather than replacing the existing
-single-day experiment.
+`beijing_tcvae` and `beijing_ddpm` reuse the same raw source and selected
+landing cache when their source and preprocessing settings match.
 
-Continue the current single-day workflow with:
+## Zurich
 
 ```bash
-uv run chabuduo preprocess beijing_kinematic_circular \
-  --source data/raw/beijing/2025-07-28.parquet --max-workers 4
-uv run chabuduo prepare beijing_kinematic_circular \
-  --selected data/interim/zbaa-landing-40nm.parquet
-uv run chabuduo validate data/processed/beijing_kinematic_circular-v1
+uv run chabuduo get zurich_tcvae
+uv run chabuduo preprocess zurich_tcvae --max-workers 4
+uv run chabuduo prepare zurich_tcvae
+uv run chabuduo validate zurich_tcvae
 ```
 
-Generation artifacts contain `train.npz`, `validation.npz`, `test.npz`,
-`metadata.parquet`, `normalization.json`, `generation.yaml`, and `manifest.yaml`.
-They are immutable: create a new output directory for a changed experiment.
+A processed directory contains:
 
-Do not delete raw sources, caches, or prepared artifacts without checking
-whether an existing run depends on them. The manifest records source hashes and
-representation details needed to interpret a run.
+```text
+train.npz
+validation.npz
+test.npz
+metadata.parquet
+normalization.json
+```
+
+The NPZ `values` arrays are already split, normalized `float32` tensors with
+shape `[N, points, features]`. Do not edit generated data files manually.

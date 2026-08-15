@@ -1,0 +1,73 @@
+name: beijing_tcvae
+dataset: beijing
+version: v1
+
+source:
+  type: feiyou_csv
+  filename: 2025-2weeks.parquet
+  pattern: "**/20??-??-??.csv"
+  date_ranges:
+    - path: 北京20250728-20250803/北京20250728-20250803
+      start_date: 2025-07-28
+      end_date: 2025-08-03
+    - path: 北京20251215-20251221/北京20251215-20251221
+      start_date: 2025-12-15
+      end_date: 2025-12-21
+  chunk_rows: 250000
+
+preprocess:
+  operation: landing
+  airport: ZBAA
+  radius_nm: 40
+  max_threshold_distance_nm: 0.1
+  min_observations: 10
+  min_duration_sec: 600
+
+prepare:
+  points: 200
+  representation:
+    name: kinematic_circular_200
+    features: [track_sin, track_cos, groundspeed_kt, altitude_ft, elapsed_time_sec]
+    units: [unitless, unitless, knot, ft, s]
+    direction: chronological
+    anchor: airport
+  split:
+    group_by: flight_id
+    train: 0.70
+    validation: 0.15
+    test: 0.15
+    seed: 42
+  normalization:
+    method: standard_per_timestep
+    fit_on: train
+
+model:
+  type: tcvae
+  hidden_channels: [64, 64, 64]
+  latent_dim: 64
+  kernel_size: 16
+  dilation_base: 2
+  sampling_factor: 10
+  dropout: 0.2
+  loss:
+    reconstruction_weight: 1.0
+    kl_weight: 1.0
+    decoder_scale: 1.0
+    learn_decoder_scale: true
+
+optimizer:
+  learning_rate: 0.001
+
+training:
+  seed: 42
+  batch_size: 64
+  max_epochs: 200
+  num_workers: 4
+  accelerator: auto
+  devices: 1
+
+sampling:
+  type: tcvae
+  count: 100
+  seed: 42
+  temperature: 1.0

@@ -1,7 +1,8 @@
 """Prepare selected ``Traffic`` for a numerical trajectory model.
 
-``preprocess`` ends with a selected and resampled ``Traffic`` collection.
-This module owns the next boundary described by ``traffic.Generation``:
+``preprocess`` ends with a selected variable-length ``Traffic`` collection.
+This module owns fixed-length resampling and the next boundary described by
+``traffic.Generation``:
 features are chosen, trajectories are split, a scaler is fitted on training
 trajectories only, and fixed-shape matrices are written as a serializable
 artifact. Models consume those arrays and never import ``Traffic``.
@@ -10,31 +11,16 @@ artifact. Models consume those arrays and never import ``Traffic``.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
 import pyproj
 from traffic.algorithms.generation import Generation as TrafficGeneration
-from traffic.core import Traffic
+from traffic.core import Flight, Traffic
 from traffic.data import airports
 
 from chabuduo.artifacts import Normalization, SplitData, write_prepared_artifact
-from chabuduo.config import (
-    DatasetConfig,
-    RepresentationSettings,
-    SplitSettings,
-    write_config,
-)
-from chabuduo.get import sha256
-
-
-class _NoModel:
-    def fit(self, X: np.ndarray, **kwargs: Any) -> _NoModel:
-        return self
-
-    def sample(self, count: int) -> tuple[np.ndarray, np.ndarray]:
-        raise NotImplementedError
+from chabuduo.config import ExperimentConfig, SplitSettings
 
 
 class _PerTimestepScaler:
@@ -81,46 +67,28 @@ def _elapsed(frame: pd.DataFrame) -> pd.Series:
     return (timestamp - timestamp.iloc[0]).dt.total_seconds()
 
 
-def _features(
-    traffic: Traffic,
-    representation: RepresentationSettings,
-    airport_code: str,
-) -> tuple[Traffic, list[str]]:
-    """Add Traffic-compatible feature columns for one representation."""
-    name = representation.name
-    if name == "projected_position_200":
-        traffic = traffic.compute_xy(
-            projection=airport_projection(airport_code)
-        )
-        traffic = traffic.iterate_lazy().assign(timedelta=_elapsed).eval()
-        return traffic, ["x", "y", "altitude"]
+def _elapsed_feature(flight: Flight) -> Flight:
+    """Add elapsed time relative to this flight's first observation."""
+    return flight.assign(elapsed_time_sec=_elapsed)
 
-    traffic = traffic.unwrap()
-    traffic = traffic.iterate_lazy().assign(timedelta=_elapsed)
-    if name == "kinematic_circular_200":
-        traffic = traffic.assign(
-            track_sin=lambda frame: np.sin(
-                np.radians(frame.track_unwrapped)
-            ),
-            track_cos=lambda frame: np.cos(
-                np.radians(frame.track_unwrapped)
-            ),
-        ).eval()
-        return traffic, [
-            "track_sin",
-            "track_cos",
-            "groundspeed",
-            "altitude",
-            "timedelta",
-        ]
-    traffic = traffic.eval()
-    return traffic, ["track_unwrapped", "groundspeed", "altitude", "timedelta"]
+# Even if you don't use all of them at once, just define them here. It doesn't
+# hurt to have them all available for any representation. We select what we
+# really need later on.
 
 
-def _split_traffic(
-    traffic: Traffic, split_config: SplitSettings
-) -> dict[str, Traffic]:
-    flights = list(traffic)
+_FEATURE_COLUMNS = {
+    "east_m": lambda frame: frame.x,
+    "north_m": lambda frame: frame.y,
+    "altitude_m": lambda frame: frame.altitude * 0.3048,
+    "track_sin": lambda frame: np.sin(np.radians(frame.track)),
+    "track_cos": lambda frame: np.cos(np.radians(frame.track)),
+    "groundspeed_kt": lambda frame: frame.groundspeed,
+    "altitude_ft": lambda frame: frame.altitude,
+}
+
+
+def _split_traffic(t: Traffic, split_config: SplitSettings) -> dict[str, Traffic]:
+    flights = list(t)
     if len(flights) < 3:
         raise ValueError("At least three trajectories are required for three splits")
     rng = np.random.default_rng(split_config.seed)
@@ -144,11 +112,11 @@ def _split_traffic(
     }
 
 
-def _ids(traffic: Traffic) -> np.ndarray:
+def _ids(t: Traffic) -> np.ndarray:
     return np.asarray(
         [
             str(getattr(flight, "flight_id", index))
-            for index, flight in enumerate(traffic)
+            for index, flight in enumerate(t)
         ],
         dtype=str,
     )
@@ -157,44 +125,53 @@ def _ids(traffic: Traffic) -> np.ndarray:
 def prepare(
     selected: Path,
     output: Path,
-    config: DatasetConfig,
+    config: ExperimentConfig,
 ) -> Path:
     """Create an immutable model-ready artifact from selected Traffic."""
     if output.exists():
         raise FileExistsError(f"{output} already exists")
-    traffic = Traffic.from_file(selected)
-    if traffic is None:
+    t = Traffic.from_file(selected)
+    if t is None:
         raise ValueError(f"Could not load selected Traffic: {selected}")
     settings = config.prepare
     if settings is None:
         raise ValueError("Dataset configuration has no prepare section")
     points = settings.points
-    traffic = traffic.resample(points).eval()
-    if traffic is None:
-        raise ValueError("Preparation produced no fixed-length trajectories")
     representation = settings.representation
     airport_code = config.preprocess.airport
-    traffic, internal_features = _features(
-        traffic, representation, airport_code
+    projection = airport_projection(airport_code)
+    t = (
+        t.compute_xy(projection=projection)
+        .assign(**_FEATURE_COLUMNS)
+        .unwrap()
+        .resample(points)
+        .pipe(_elapsed_feature)
+        .eval()
     )
-    splits = _split_traffic(traffic, settings.split)
-    scaler = _PerTimestepScaler(points, len(internal_features))
-    generation = TrafficGeneration(_NoModel(), internal_features, scaler=scaler)
+    if t is None:
+        raise ValueError("Preparation produced no fixed-length trajectories")
+    features = representation.features
+    splits = _split_traffic(t, settings.split)
+    scaler = _PerTimestepScaler(points, len(features))
+    generation = TrafficGeneration(None, features, scaler=scaler)
     generation.fit_preprocessing(splits["train"])
 
     prepared: dict[str, SplitData] = {}
     records: list[dict[str, str]] = []
-    for name, split in splits.items():
-        matrix = generation.transform_features(split)
-        features = len(internal_features)
-        values = matrix.reshape(len(split), points, features).astype(np.float32)
-        identifiers = _ids(split)
+    for name, t in splits.items():
+        matrix = generation.transform_features(t)
+        feature_count = len(features)
+        values = matrix.reshape(len(t), points, feature_count).astype(np.float32)
+        identifiers = _ids(t)
         elapsed = np.asarray(
-            [_elapsed(flight.data).to_numpy(dtype=np.float32) for flight in split],
+            [
+                flight.data.elapsed_time_sec.to_numpy(dtype=np.float32)
+                for flight in t
+            ],
             dtype=np.float32,
         )
         prepared[name] = SplitData(
-            positions=values,
+            values=values,
             elapsed_time=elapsed,
             trajectory_id=identifiers,
             split_group_id=identifiers.copy(),
@@ -204,30 +181,6 @@ def prepare(
             for identifier in identifiers
         )
 
-    projection = pyproj.CRS(airport_projection(airport_code).srs)
-    manifest = {
-        "artifact_type": "prepared_dataset",
-        "dataset": config.name,
-        "dataset_version": config.version,
-        "source": str(selected.resolve()),
-        "source_sha256": sha256(selected),
-        "trajectory_count": len(traffic),
-        "preprocess": config.preprocess.model_dump(mode="json"),
-        "representation": {
-            **representation.model_dump(mode="json"),
-            "points": points,
-            "shape": [points, len(internal_features)],
-            "internal_features": internal_features,
-            "projection_wkt": projection.to_wkt(),
-            "airport": airport_code,
-        },
-        "split": settings.split.model_dump(mode="json"),
-        "normalization": {
-            **settings.normalization.model_dump(mode="json"),
-            "fit_on": "train",
-            "method": "standard_per_timestep",
-        },
-    }
     if scaler.normalization is None:
         raise RuntimeError("Generation scaler was not fitted")
     write_prepared_artifact(
@@ -235,56 +188,5 @@ def prepare(
         prepared,
         scaler.normalization,
         pd.DataFrame.from_records(records),
-        manifest,
-    )
-    write_config(
-        {"features": internal_features, "source": str(selected.resolve())},
-        output / "generation.yaml",
     )
     return output
-
-
-def build_generated_traffic(
-    values: np.ndarray,
-    elapsed_time: np.ndarray,
-    manifest: dict[str, Any],
-) -> Traffic:
-    """Reconstruct model samples with Traffic Generation's canonical adapter."""
-    representation = manifest["representation"]
-    name = representation["name"]
-    projection = pyproj.Proj(pyproj.CRS.from_wkt(representation["projection_wkt"]))
-    projected = name in {"projected_position_200", "enu_position_20"}
-    if projected:
-        altitude_ft = values[:, :, 2] / 0.3048
-        model_values = np.stack(
-            (values[:, :, 0], values[:, :, 1], altitude_ft, elapsed_time),
-            axis=2,
-        )
-        features = ["x", "y", "altitude", "timedelta"]
-    else:
-        airport = airports[representation["airport"]]
-        if name == "kinematic_circular_200":
-            track = np.degrees(
-                np.arctan2(values[:, :, 0], values[:, :, 1])
-            ) % 360
-            speed = values[:, :, 2]
-            altitude = values[:, :, 3]
-        else:
-            track = values[:, :, 0]
-            speed = values[:, :, 1]
-            altitude = values[:, :, 2]
-        model_values = np.stack(
-            (track, speed, altitude, elapsed_time), axis=2
-        )
-        features = ["track", "groundspeed", "altitude", "timedelta"]
-    adapter = TrafficGeneration(_NoModel(), features)
-    kwargs: dict[str, Any] = {"projection": projection}
-    if not projected:
-        kwargs.update(
-            coordinates={
-                "latitude": airport.latitude,
-                "longitude": airport.longitude,
-            },
-            forward=False,
-        )
-    return adapter.build_traffic(model_values.reshape(len(values), -1), **kwargs)

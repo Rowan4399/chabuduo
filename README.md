@@ -28,9 +28,10 @@ The CLI and artifact path work for Beijing and Zurich. The only implemented
 model is an unconditional, standard-prior temporal convolutional VAE. It does
 **not yet generate convincing unconditional Beijing trajectories**.
 
-Three Beijing representations have been tested or prepared:
+Three historical Beijing runs remain useful evidence. Their directory names
+predate the current single-config workflow:
 
-| Configuration | Model values | Shape | Status |
+| Historical run | Model values | Shape | Status |
 |---|---|---:|---|
 | `beijing` | projected east, north, MSL altitude | `[N, 200, 3]` | trained for 200 epochs; generations were noisy |
 | `beijing_kinematic` | unwrapped track, groundspeed, altitude, elapsed time | `[N, 200, 4]` | trained for 1,000 epochs; best validation epoch 331; prior generations were poor |
@@ -81,106 +82,79 @@ Before working on the model, follow [`HANDOFF.md`](HANDOFF.md). It explains the
 three checks that prevent most wasted experiments: install the dev environment,
 verify the Windows-to-Linux GPU SSH connection, and run the local smoke tests.
 
+## One YAML per experiment
+
+The committed YAML is the only configuration source of truth. Current choices
+are:
+
+```text
+src/chabuduo/configs/beijing_tcvae.yaml
+src/chabuduo/configs/beijing_ddpm.yaml
+src/chabuduo/configs/zurich_tcvae.yaml
+src/chabuduo/configs/zurich_ddpm.yaml
+```
+
+Each file contains source, preprocessing, tensor preparation, model, optimizer,
+training, and sampling parameters. Every command receives the same experiment
+name.
+
 ## Beijing workflow
 
-Beijing can be staged from an existing local Parquet file:
+The Beijing configurations convert both configured Feiyou weeks. Pass the
+parent directory containing the two dated source directories:
 
 ```bash
-uv run chabuduo get beijing \
-  --source ../2025-07-28.parquet
+uv run chabuduo get beijing_tcvae --source /path/to/feiyou-root
+uv run chabuduo preprocess beijing_tcvae --max-workers 4
+uv run chabuduo prepare beijing_tcvae
+uv run chabuduo validate beijing_tcvae
+uv run chabuduo train beijing_tcvae --smoke
 ```
 
-The Feiyou adapter can instead convert the seven configured daily CSV files
-into one Traffic-compatible raw Parquet. The source root may contain a nested
-directory; the YAML glob finds the daily files but requires exactly one file for
-every configured date.
+After the smoke run succeeds, omit `--smoke` to use the training budget declared
+in `beijing_tcvae.yaml`. Sampling and plotting also read their count, seed, and
+model parameters from that file:
 
 ```bash
-uv run chabuduo get beijing \
-  --config src/chabuduo/configs/beijing_feiyou.yaml \
-  --source /path/to/北京20250728-20250803
+uv run chabuduo sample beijing_tcvae
+uv run chabuduo plot beijing_tcvae
 ```
 
-This writes `data/raw/beijing/2025-07-28_2025-08-03.parquet` and a YAML sidecar
-with the input hashes, row counts, and unit conversions. Keep the existing
-single-day raw, interim, and processed artifacts: the seven-day source is a new
-experiment and must use distinct downstream output paths.
-
-The recommended next representation to inspect is circular kinematics:
-
-```bash
-uv run chabuduo preprocess beijing_kinematic_circular \
-  --source data/raw/beijing/2025-07-28.parquet \
-  --max-workers 4
-
-uv run chabuduo prepare beijing_kinematic_circular \
-  --selected data/interim/zbaa-landing-40nm.parquet
-
-uv run chabuduo validate \
-  data/processed/beijing_kinematic_circular-v1
-```
-
-A long local or remote run can be started with:
-
-```bash
-uv run chabuduo train \
-  data/processed/beijing_kinematic_circular-v1 \
-  --config src/chabuduo/configs/tcvae_long.yaml \
-  --output runs/beijing-kinematic-circular-v1-tcvae-seed-42-1000 \
-  --seed 42
-```
-
-That run already exists locally. Its best checkpoint can be sampled and plotted
-with:
-
-```bash
-uv run chabuduo sample \
-  runs/beijing-kinematic-circular-v1-tcvae-seed-42-1000 \
-  --count 100 \
-  --seed 42
-
-uv run chabuduo plot \
-  runs/beijing-kinematic-circular-v1-tcvae-seed-42-1000/samples/seed-42-n-100
-```
-
-`--temperature` changes the standard-normal latent sampling scale. It is an
-experiment parameter, not a substitute for checking prior/posterior mismatch.
+The Beijing TCVAE uses circular track features. The Beijing DDPM configuration
+uses scalar unwrapped track and records the conditional-DDPM design, but DDPM
+training and flow labels are not implemented yet.
 
 ### Shared preprocessing cache
 
-Landing detection, 40 NM cropping, and 200-point resampling are shared by all
-Beijing representations. Their reusable preprocessing cache is:
+Landing detection and 40 NM selection are shared by the Beijing experiments:
 
 ```text
-data/interim/zbaa-landing-40nm.parquet
+data/interim/zbaa-landing-40nm-2025-2weeks-v1.parquet
 ```
 
-Its YAML sidecar records the source hash and selection parameters. Changing the
-downstream representation should use this cache instead of repeating landing
-detection.
+The cache contains variable-length selected `Traffic`. Fixed-length resampling
+happens in `prepare`. There is no generated YAML sidecar; when the raw source or
+selection policy changes, choose a new `--output` path or move the old cache
+aside before recomputing it.
 
 ## Zurich workflow
 
-On a cold cache, `get zurich` lets `traffic` download
-`landing_zurich_2019` into its own dataset cache. It does **not** copy the file
-into `data/raw/`; on a warm cache it simply returns the existing cached path.
-`preprocess` resolves that same cache automatically:
+On a cold cache, `get` lets `traffic` download `landing_zurich_2019` into its
+own dataset cache. It does not copy that source into `data/raw/`:
 
 ```bash
-uv run chabuduo get zurich
-
-uv run chabuduo preprocess zurich \
-  --max-workers 4
-uv run chabuduo prepare zurich \
-  --selected data/interim/lszh-40nm-200-points.parquet
-
-uv run chabuduo validate data/processed/zurich-v1
-
-uv run chabuduo train data/processed/zurich-v1 --smoke
+uv run chabuduo get zurich_tcvae
+uv run chabuduo preprocess zurich_tcvae --max-workers 4
+uv run chabuduo prepare zurich_tcvae
+uv run chabuduo validate zurich_tcvae
+uv run chabuduo train zurich_tcvae --smoke
+uv run chabuduo sample zurich_tcvae
+uv run chabuduo plot zurich_tcvae
 ```
 
-Zurich currently uses the projected-position representation. Do not compare it
-with a Beijing kinematic run as though representation were controlled.
+Zurich TCVAE and DDPM configurations use the same four kinematic values. The
+DDPM configuration remains non-executable until its trainer and conditioning
+labels are added.
 
 ## What `validate` means
 
@@ -191,52 +165,42 @@ leakage. It exits with a nonzero status when training should not proceed.
 
 ## Artifacts
 
-Prepared datasets contain:
+Prepared datasets contain only ready tensors and their numerical metadata:
 
 ```text
-data/processed/<configuration>-<version>/
+data/processed/<experiment>-<version>/
 ├── train.npz
 ├── validation.npz
 ├── test.npz
 ├── metadata.parquet
-├── normalization.json
-├── generation.yaml
-└── manifest.yaml
+└── normalization.json
 ```
 
-The tensor shape and feature count come from `manifest.yaml`; they are not
-always `[N, 200, 3]`. The legacy NPZ key `positions` stores normalized model
-values even for kinematic representations. Normalization is fitted on the
-training split only, with separate statistics for every timestep and feature.
+Each NPZ stores normalized `values` with shape `[N, points, features]`, elapsed
+time, and trajectory/split identifiers. Feature order, units, and point count
+come from the original experiment YAML. Normalization is fitted on the training
+split only, with separate statistics for every timestep and feature.
 
 Training runs contain:
 
 ```text
-runs/<run>/
+runs/<experiment>-<version>-seed-<seed>/
 ├── checkpoints/best.ckpt
 ├── checkpoints/last.ckpt
 ├── logs/
-├── resolved-config.yaml
 ├── environment.json
-├── manifest.yaml
-└── status.yaml
+└── samples/
 ```
 
-Sampling writes:
+Sampling writes `samples.npz`, `generated.parquet`, and—after `plot`—the PNG.
+No stage generates another YAML file.
 
-```text
-runs/<run>/samples/<sample>/
-├── samples.npz
-├── generated.parquet
-├── manifest.yaml
-└── <airport>-trajectories.png  # after `plot`
-```
-
-For kinematic runs, `samples.npz` stores model values, sanitized kinematic
-values, and reconstructed projected positions. `generated.parquet` is a
-`Traffic`-compatible point table. Kinematic landing trajectories are
-reconstructed backwards from a Beijing airport anchor, following the endpoint
-convention described in the `traffic` generation guide.
+`samples.npz` stores inverse-normalized model `values` in the feature order from
+the experiment YAML plus the elapsed-time context used for reconstruction.
+`generated.parquet` stores the reconstructed `Traffic` point table, including
+canonical track/speed/altitude/timestamps, projected `x/y`, and the original
+model columns. Kinematic landings are reconstructed backwards from the airport
+anchor following the `traffic` generation guide.
 
 ## Scope and next decision
 

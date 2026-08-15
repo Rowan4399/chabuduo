@@ -10,7 +10,7 @@ and usable one command at a time.
 - Treat files under `docs/history/` as historical context only. They are not the
   current architecture or task list.
 - When documentation disagrees, prefer `README.md`, then this file, then the
-  current manifests and resolved run configurations.
+  committed experiment YAML used by every CLI stage.
 
 ## Preserve current work
 
@@ -82,6 +82,7 @@ Source is https://github.com/xoolive/traffic, prefer the `prepare-v3` branch
   than teaching a workaround.
 - Keep `Traffic`, `Flight`, `LazyTraffic`, and the underlying `.data` DataFrame
   distinct in code and explanations.
+- Name variables and parameters holding a `Traffic` object `t`, never `traffic`.
 - Use `LazyTraffic.eval(cache_file=...)` for expensive flight-wise operations
   when that API fits the stage.
 - `Flight.distance(Airport)` returns nautical miles.
@@ -110,8 +111,8 @@ Source is https://github.com/xoolive/traffic, prefer the `prepare-v3` branch
 
 - Run `validate` before training.
 - Start new code paths with `--smoke`, then use the declared training budget.
-- Store the resolved configuration, seed, environment, logs, best checkpoint,
-  and last checkpoint.
+- Commit the experiment YAML before training, and store the environment, logs,
+  best checkpoint, and last checkpoint.
 - Select checkpoints with validation data, never test data.
 - Inspect training loss, validation loss, reconstruction loss, and KL loss. Do
   not report only the last epoch.
@@ -136,7 +137,7 @@ Source is https://github.com/xoolive/traffic, prefer the `prepare-v3` branch
 - Redirect long training output to a log file and inspect the final status and
   metrics.
 - Copy the complete run back under `chabuduo/runs/`, including checkpoints,
-  resolved config, CSV metrics, environment, status, and remote log.
+  CSV metrics, environment, samples, plots, and remote log.
 - Do not leave the only copy of a result on the remote host.
 
 ## Plot geographic data correctly

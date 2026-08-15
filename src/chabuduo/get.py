@@ -10,9 +10,7 @@ then operates on its `Flight` objects. Keeping raw files and in-memory Traffic
 objects separate makes the boundary easy to inspect: `get` answers "where is
 the file?"; preprocessing answers "how do we interpret its flights?".
 
-For local copies, the SHA-256 sidecar records the identity of the exact bytes
-used later. A filename or dataset name is not enough because the underlying file
-may change while retaining its name.
+The committed experiment YAML is the workflow's only configuration file.
 """
 
 from __future__ import annotations
@@ -21,8 +19,8 @@ import hashlib
 import shutil
 from pathlib import Path
 
-from chabuduo.config import DatasetConfig, write_config
-from chabuduo.sources.feiyou import CONVERSION, convert_files, discover_files
+from chabuduo.config import ExperimentConfig
+from chabuduo.sources.feiyou import convert_files, discover_files
 
 
 def sha256(path: Path) -> str:
@@ -56,7 +54,7 @@ def resolve_traffic_dataset(dataset_name: str) -> Path:
 
 
 def stage_dataset(
-    config: DatasetConfig,
+    config: ExperimentConfig,
     output: Path,
     *,
     source: Path | None = None,
@@ -82,10 +80,6 @@ def stage_dataset(
 
     if source_type == "local_parquet":
         shutil.copy2(source, output)
-        provenance = {
-            "mode": "local_copy",
-            "source": str(source),
-        }
     elif source_type == "feiyou_csv":
         date_ranges = [
             (item.path, (item.start_date, item.end_date))
@@ -96,54 +90,8 @@ def stage_dataset(
             pattern=source_config.pattern,
             date_ranges=date_ranges,
         )
-        conversion = convert_files(
-            sources,
-            output,
-            chunk_rows=source_config.chunk_rows,
-        )
-        source_results = {
-            item["path"]: item for item in conversion["sources"]
-        }
-        provenance = {
-            "mode": "feiyou_csv_conversion",
-            "source_root": str(source),
-            "pattern": source_config.pattern,
-            "date_ranges": [
-                {
-                    "path": str(relative_path),
-                    "start_date": str(start_date),
-                    "end_date": str(end_date),
-                }
-                for relative_path, (start_date, end_date) in date_ranges
-            ],
-            "conversion": CONVERSION,
-            "rows": conversion["rows"],
-            "duplicates_removed": conversion["duplicates_removed"],
-            "sources": [
-                {
-                    "file": str(path),
-                    "bytes": path.stat().st_size,
-                    "sha256": sha256(path),
-                    "input_rows": source_results[str(path)]["input_rows"],
-                    "rows": source_results[str(path)]["rows"],
-                    "duplicates_removed": source_results[str(path)][
-                        "duplicates_removed"
-                    ],
-                }
-                for path in sources
-            ],
-        }
+        convert_files(sources, output, chunk_rows=source_config.chunk_rows)
     else:
         raise ValueError(f"Unsupported source type: {source_type}")
 
-    manifest = {
-        "artifact_type": "raw_dataset",
-        "dataset": config.name,
-        "version": config.version,
-        "file": output.name,
-        "bytes": output.stat().st_size,
-        "sha256": sha256(output),
-        "provenance": provenance,
-    }
-    write_config(manifest, output.with_suffix(output.suffix + ".yaml"))
     return output

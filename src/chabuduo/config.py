@@ -1,10 +1,10 @@
-"""Load generic artifacts and validate user-editable dataset YAML files."""
+"""Validate the one committed YAML describing each complete experiment."""
 
 from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 import yaml
 from pydantic import (
@@ -86,6 +86,12 @@ class RepresentationSettings(StrictModel):
     context: list[str] = Field(default_factory=list)
     anchor: str | None = None
 
+    @model_validator(mode="after")
+    def one_unit_per_feature(self) -> RepresentationSettings:
+        if len(self.features) != len(self.units):
+            raise ValueError("representation features and units must have equal length")
+        return self
+
 
 class SplitSettings(StrictModel):
     group_by: Literal["flight_id"]
@@ -114,12 +120,104 @@ class PrepareSettings(StrictModel):
     normalization: NormalizationSettings
 
 
-class DatasetConfig(StrictModel):
+class TCVAELossSettings(StrictModel):
+    reconstruction_weight: PositiveFloat
+    kl_weight: PositiveFloat
+    decoder_scale: PositiveFloat = 1.0
+    learn_decoder_scale: bool = True
+
+
+class TCVAEModelSettings(StrictModel):
+    type: Literal["tcvae"]
+    hidden_channels: list[PositiveInt] = Field(min_length=1)
+    latent_dim: PositiveInt
+    kernel_size: PositiveInt
+    dilation_base: PositiveInt
+    sampling_factor: PositiveInt
+    dropout: float = Field(ge=0, lt=1)
+    loss: TCVAELossSettings
+
+
+class ConditioningSettings(StrictModel):
+    feature: str
+
+
+class DDPMModelSettings(StrictModel):
+    type: Literal["ddpm"]
+    architecture: Literal["dual_branch_1d_unet"]
+    hidden_channels: PositiveInt
+    num_layers: PositiveInt
+    diffusion_steps: PositiveInt
+    prediction: Literal["noise"]
+    conditioning: ConditioningSettings | None = None
+
+
+ModelSettings = Annotated[
+    TCVAEModelSettings | DDPMModelSettings,
+    Field(discriminator="type"),
+]
+
+
+class OptimizerSettings(StrictModel):
+    learning_rate: PositiveFloat
+    weight_decay: float = Field(default=0, ge=0)
+
+
+class TrainingSettings(StrictModel):
+    seed: int
+    batch_size: PositiveInt
+    max_epochs: PositiveInt
+    num_workers: int = Field(ge=0)
+    accelerator: str = "auto"
+    devices: PositiveInt = 1
+    gradient_clip_norm: PositiveFloat | None = None
+    mixed_precision: bool = False
+
+
+class TCVAESamplingSettings(StrictModel):
+    type: Literal["tcvae"]
+    count: PositiveInt
+    seed: int
+    temperature: float = Field(default=1.0, gt=0)
+
+
+class DDPMSamplingSettings(StrictModel):
+    type: Literal["ddpm"]
+    count: PositiveInt
+    seed: int
+    steps: PositiveInt
+    eta: float = Field(default=0, ge=0, le=1)
+    minimum_groundspeed_kt: float
+    maximum_groundspeed_kt: float
+    minimum_altitude_ft: float
+    maximum_altitude_ft: float
+
+
+SamplingSettings = Annotated[
+    TCVAESamplingSettings | DDPMSamplingSettings,
+    Field(discriminator="type"),
+]
+
+
+class ExperimentConfig(StrictModel):
+    """One committed configuration for every stage of one experiment."""
+
     name: str
+    dataset: Literal["beijing", "zurich"]
     version: str
     source: Source
     preprocess: PreprocessSettings
-    prepare: PrepareSettings | None = None
+    prepare: PrepareSettings
+    model: ModelSettings
+    optimizer: OptimizerSettings
+    training: TrainingSettings
+    sampling: SamplingSettings
+
+    @model_validator(mode="after")
+    def model_and_sampling_match(self) -> ExperimentConfig:
+        if self.model.type != self.sampling.type:
+            raise ValueError("model and sampling types must match")
+        return self
 
 
 def config_path(name: str) -> Path:
@@ -130,21 +228,47 @@ def config_path(name: str) -> Path:
     return path
 
 
-def load_config(path: Path) -> dict[str, Any]:
-    """Load a generic YAML mapping used by artifacts and model configurations."""
+def raw_path(config: ExperimentConfig) -> Path:
+    return PROJECT_ROOT / "data" / "raw" / config.dataset / config.source.filename
+
+
+def selected_path(config: ExperimentConfig) -> Path:
+    settings = config.preprocess
+    source_name = Path(config.source.filename).stem
+    filename = (
+        f"{settings.airport.lower()}-{settings.operation}-"
+        f"{settings.radius_nm:g}nm-{source_name}-{config.version}.parquet"
+    )
+    return PROJECT_ROOT / "data" / "interim" / filename
+
+
+def prepared_path(config: ExperimentConfig) -> Path:
+    return PROJECT_ROOT / "data" / "processed" / f"{config.name}-{config.version}"
+
+
+def run_path(config: ExperimentConfig, *, smoke: bool = False) -> Path:
+    suffix = "-smoke" if smoke else ""
+    return (
+        PROJECT_ROOT
+        / "runs"
+        / f"{config.name}-{config.version}-seed-{config.training.seed}{suffix}"
+    )
+
+
+def sample_path(config: ExperimentConfig, run: Path) -> Path:
+    sampling = config.sampling
+    suffix = f"seed-{sampling.seed}-n-{sampling.count}"
+    if sampling.type == "tcvae" and sampling.temperature != 1.0:
+        suffix += f"-t-{sampling.temperature:g}"
+    if sampling.type == "ddpm":
+        suffix += f"-steps-{sampling.steps}-eta-{sampling.eta:g}"
+    return run / "samples" / suffix
+
+
+def load_experiment_config(path: Path) -> ExperimentConfig:
+    """Load the single source of truth for one complete experiment."""
     with path.open(encoding="utf8") as handle:
         value = yaml.safe_load(handle)
     if not isinstance(value, dict):
         raise ValueError(f"Configuration must contain a mapping: {path}")
-    return value
-
-
-def load_dataset_config(path: Path) -> DatasetConfig:
-    """Load and validate a dataset workflow configuration."""
-    return DatasetConfig.model_validate(load_config(path))
-
-
-def write_config(config: dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf8") as handle:
-        yaml.safe_dump(config, handle, sort_keys=False)
+    return ExperimentConfig.model_validate(value)
