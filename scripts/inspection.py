@@ -40,3 +40,48 @@ print(
     f"{observation_count / trajectory_count:.2f}"
 )
 # %%
+# 绘制所有检测到的降落轨迹，以及上面使用的 40 海里范围。
+# Geod 使用米作为单位，1 海里等于 1852 米。
+
+beijing = airports["ZBAA"]
+RADIUS_NM = 40
+N_SAMPLES = 200
+
+angles = np.linspace(0, 360, 361)
+longitude, latitude, _ = Geod(ellps="WGS84").fwd(
+    np.full_like(angles, beijing.longitude),
+    np.full_like(angles, beijing.latitude),
+    angles,
+    np.full_like(angles, RADIUS_NM * 1852),
+)
+
+with plt.style.context("traffic"):
+    figure, ax = plt.subplots(
+        figsize=(8, 8), subplot_kw={"projection": Mercator()}
+    )
+    preprocessed.plot(ax, color="#4c78a8", alpha=0.1, linewidth=0.5)
+    beijing.plot(ax, footprint=False)
+    ax.plot(
+        longitude,
+        latitude,
+        color="#e45756",
+        label=f"{RADIUS_NM} nm",
+        transform=PlateCarree(),
+    )
+    ax.set_extent(
+        (
+            preprocessed.data.longitude.min(),
+            preprocessed.data.longitude.max(),
+            preprocessed.data.latitude.min(),
+            preprocessed.data.latitude.max(),
+        ),
+        crs=PlateCarree(),
+    )
+    ax.set_title("ZBAA landing trajectories and terminal area")
+    ax.legend()
+
+FIGURE_FILE = Path.cwd() / "zbaa_radius_diagnostics.png"
+figure.savefig(FIGURE_FILE, dpi=170, bbox_inches="tight")
+print(f"图片文件：{FIGURE_FILE}")
+figure
+# %%
