@@ -71,6 +71,51 @@ def _landing_in_asma(
         return None
     return selected
 
+def _takeoff_in_asma(
+    flight: Flight,
+    *,
+    airport_code: str,
+    radius_nm: float,
+    max_threshold_distance_nm: float,
+    min_observations: int,
+    min_duration_sec: float,
+) -> Flight | None:
+    airport = airports[airport_code]
+
+    takeoff = flight.takeoff(airport).next()
+    if takeoff is None:
+        return None
+
+    runway_name = takeoff.runway_max
+    if runway_name is None:
+        return None
+    
+    runway = airport.runways[runway_name]
+    threshold = next(
+        point for point in runway.tuple_runway if point.name == runway_name
+    )
+
+    # Keep an observed receiver point rather than moving a point onto the
+    # runway. closest_point() reports metres, while the YAML tolerance is NM.
+    closest = flight.closest_point(threshold)
+    if closest.distance > max_threshold_distance_nm * 1852:
+        return None
+
+    # Include the closest observation, then retain only the part inside the
+    # circular ASMA approximation. Flight.distance(Airport) returns NM.
+    selected = flight.after(closest.timestamp, strict=False)
+    if selected is None:
+        return None
+    
+    selected = selected.distance(airport).query(f"distance < {radius_nm}")
+    if selected is None:
+        return None
+    
+    if len(selected.data) < min_observations:
+        return None
+    if selected.duration.total_seconds() < min_duration_sec:
+        return None
+    return selected
 
 def load_source_traffic(source: Path, config: ExperimentConfig) -> Traffic:
     """Load a source Parquet as Traffic, using configured columns if present."""
@@ -102,20 +147,31 @@ def preprocess(
     t = load_source_traffic(source, config)
     settings = config.preprocess
     operation = settings.operation
-    if operation != "landing":
+
+    # if operation != "landing":
+    #     raise ValueError(
+    #         f"Unsupported preprocess operation: {operation!r}; "
+    #         "takeoff will be added after its endpoint convention is tested"
+    #     )
+    if operation == "landing":
+        selector = _landing_in_asma
+        description = "Selecting terminal landings"
+    elif operation == "takeoff":
+        selector = _takeoff_in_asma
+        description = "Selecting terminal takeoffs"
+    else:
         raise ValueError(
-            f"Unsupported preprocess operation: {operation!r}; "
-            "takeoff will be added after its endpoint convention is tested"
+            f"Unsupported preprocess operation: {operation!r}"
         )
 
     res = t.assign_id().pipe(
-        _landing_in_asma,
+        selector,
         airport_code=settings.airport,
         radius_nm=settings.radius_nm,
         max_threshold_distance_nm=settings.max_threshold_distance_nm,
         min_observations=settings.min_observations,
         min_duration_sec=settings.min_duration_sec,
-    ).eval(max_workers=max_workers, desc="Selecting terminal landings")
+    ).eval(max_workers=max_workers, desc=description)
     if res is None:
         raise ValueError("Preprocessing selected no trajectories")
 

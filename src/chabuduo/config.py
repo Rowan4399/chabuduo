@@ -63,7 +63,7 @@ Source = Annotated[
 
 
 class PreprocessSettings(StrictModel):
-    operation: Literal["landing"]
+    operation: Literal["landing","takeoff"]
     airport: str = Field(pattern=r"^[A-Z0-9]{4}$")
     radius_nm: PositiveFloat
     max_threshold_distance_nm: PositiveFloat
