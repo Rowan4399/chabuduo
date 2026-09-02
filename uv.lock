@@ -446,7 +446,7 @@ requires-dist = [
     { name = "torch", marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'linux' and sys_platform != 'win32')", specifier = "==2.5.1" },
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==2.5.1", index = "https://download.pytorch.org/whl/cu121" },
     { name = "torch", marker = "sys_platform == 'win32'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" },
-    { name = "traffic", specifier = ">=2.13" },
+    { name = "traffic", git = "https://github.com/xoolive/traffic.git?branch=prepare-v3" },
     { name = "typer", specifier = ">=0.15" },
 ]
 
@@ -2620,8 +2620,8 @@ wheels = [
 
 [[package]]
 name = "traffic"
-version = "2.13"
-source = { registry = "https://pypi.org/simple" }
+version = "2.13.post77.dev0+3d389be"
+source = { git = "https://github.com/xoolive/traffic.git?branch=prepare-v3#3d389be4dd66ac08a7186bca76891e570313c221" }
 dependencies = [
     { name = "cartes" },
     { name = "httpx" },
@@ -2637,10 +2637,6 @@ dependencies = [
     { name = "rich" },
     { name = "rs1090" },
     { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/bd/19/782c2d66ed957592e48a7f3767a6f1b4cb75b0cec2fb090845562713da0d/traffic-2.13.tar.gz", hash = "sha256:dfa3313f79b7737de402181c224b2d7a913c15d942f18733548b29223a6ee3ed", size = 56865945, upload-time = "2025-07-22T07:54:14.353Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d1/b2/6d4e64fe996a18e0bcfeb79f2203b404459179d9437934bd69ef487bea1a/traffic-2.13-py3-none-any.whl", hash = "sha256:5e0cd61d931d03103294361542188f08f959a55e862d5cba80ab61291021e66c", size = 28330703, upload-time = "2025-07-22T07:54:11.639Z" },
 ]
 
 [[package]]
