@@ -131,7 +131,7 @@ def discover_files(
 
 
 def _drop_duplicate_observations(
-    chunk: pd.DataFrame, seen: set[int]
+    chunk: pd.DataFrame, seen: set[int], previous_seen:set[int],
 ) -> tuple[pd.DataFrame, int]:
     """Keep the first row for each aircraft timestamp in one daily file."""
     addresses = pd.to_numeric(chunk["icao"], errors="raise").astype("int64")
@@ -144,7 +144,7 @@ def _drop_duplicate_observations(
     for address, timestamp in zip(addresses, timestamps, strict=True):
         # ICAO addresses use 24 bits, so this packs both integers exactly.
         key = (int(timestamp) << 24) | int(address)
-        keep.append(key not in seen)
+        keep.append(key not in seen and key not in previous_seen)
         seen.add(key)
     return chunk.loc[keep], keep.count(False)
 
@@ -189,6 +189,8 @@ def convert_files(
 
     rows_by_source: list[dict[str, Any]] = []
     total_rows = 0
+    previous_seen: set[int] = set()
+
     try:
         with pq.ParquetWriter(temporary, OUTPUT_SCHEMA, compression="snappy") as writer:
             for source in sources:
@@ -204,7 +206,7 @@ def convert_files(
                 )
                 for chunk in chunks:
                     source_input_rows += len(chunk)
-                    chunk, duplicates = _drop_duplicate_observations(chunk, seen)
+                    chunk, duplicates = _drop_duplicate_observations(chunk,seen,previous_seen,)
                     source_duplicates += duplicates
                     converted = _convert_chunk(chunk)
                     table = pa.Table.from_pandas(
@@ -217,6 +219,7 @@ def convert_files(
                     source_rows += len(converted)
                     total_rows += len(converted)
                     print(f"{total_rows:,} rows written", flush=True)
+                previous_seen = seen
                 rows_by_source.append(
                     {
                         "path": str(source),
