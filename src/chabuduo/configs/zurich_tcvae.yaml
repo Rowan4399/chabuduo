@@ -53,7 +53,7 @@ optimizer:
 training:
   seed: 42
   batch_size: 64
-  max_epochs: 200
+  max_epochs: 1000
   num_workers: 4
   accelerator: auto
   devices: 1
