@@ -1,14 +1,50 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
 SPLITS = ("train", "validation", "test")
+PREPARED_FILES = (
+    "train.npz",
+    "validation.npz",
+    "test.npz",
+    "normalization.json",
+    "metadata.parquet",
+)
+
+
+def sha256(path: Path) -> str:
+    """Return the SHA-256 digest for one artifact file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def prepared_artifact_identity(artifact: Path) -> dict[str, Any]:
+    """Describe the exact prepared dataset consumed by a run."""
+    files = {name: sha256(artifact / name) for name in PREPARED_FILES}
+    digest = hashlib.sha256()
+    for name, value in files.items():
+        digest.update(f"{name}:{value}\n".encode())
+    return {
+        "path": str(artifact.resolve()),
+        "sha256": digest.hexdigest(),
+        "files": files,
+    }
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    """Write a stable, human-readable JSON artifact."""
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf8")
 
 
 @dataclass(frozen=True)

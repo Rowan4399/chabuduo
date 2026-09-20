@@ -13,10 +13,12 @@ dependencies = [
   "pyproj>=3.7",
   "pydantic>=2.11",
   "pyyaml>=6.0",
+  "scikit-learn>=1.6",
   "torch==2.5.1; sys_platform != 'win32'",
   "torch==2.7.1; sys_platform == 'win32'",
   "traffic>=2.13",
   "typer>=0.15",
+  "tensorboard>=2.21.0",
 ]
 
 [project.scripts]

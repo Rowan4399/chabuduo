@@ -132,7 +132,7 @@ def validate_command(
         typer.echo(f"ERROR: {error}", err=True)
         raise typer.Exit(code=1) from error
     for message in messages:
-        typer.echo(f"✓ {message}")
+        typer.echo(f"OK: {message}")
 
 
 @app.command("train")
@@ -146,6 +146,23 @@ def train_command(
     smoke: Annotated[
         bool, typer.Option(help="Run one tiny CPU epoch to test the complete path")
     ] = False,
+    resume: Annotated[
+        bool, typer.Option(help="Resume the run from its last checkpoint")
+    ] = False,
+    additional_epochs: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Epochs to add beyond the last checkpoint; requires --resume",
+        ),
+    ] = None,
+    learning_rate: Annotated[
+        float | None,
+        typer.Option(
+            min=0,
+            help="Override the restored optimizer learning rate; requires --resume",
+        ),
+    ] = None,
 ) -> None:
     """Train the model selected by the experiment configuration."""
     configuration = _experiment_config(experiment, config)
@@ -154,6 +171,9 @@ def train_command(
         output or run_path(configuration, smoke=smoke),
         configuration,
         smoke=smoke,
+        resume=resume,
+        additional_epochs=additional_epochs,
+        learning_rate=learning_rate,
     )
     typer.echo(f"RUN={result}")
 
@@ -192,6 +212,9 @@ def plot_command(
         Path | None, typer.Option(help="Prepared tensor directory")
     ] = None,
     output: Annotated[Path | None, typer.Option(help="PNG output path")] = None,
+    count: Annotated[
+        int, typer.Option(min=1, help="Trajectories shown in each panel")
+    ] = 100,
     config: ConfigOption = None,
 ) -> None:
     """Plot held-out and generated trajectories in the local frame."""
@@ -202,6 +225,7 @@ def plot_command(
         artifact or prepared_path(configuration),
         configuration,
         output=output,
+        count=count,
     )
     typer.echo(f"OUTPUT={result}")
 

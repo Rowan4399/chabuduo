@@ -29,6 +29,7 @@ def _landing_in_asma(
     flight: Flight,
     *,
     airport_code: str,
+    allowed_runways: frozenset[str] | None,
     radius_nm: float,
     max_threshold_distance_nm: float,
     min_observations: int,
@@ -46,6 +47,8 @@ def _landing_in_asma(
     # A physical runway has two named thresholds. Select the threshold whose
     # name matches the detected landing direction.
     runway_name = landing.ILS_max
+    if allowed_runways is not None and runway_name not in allowed_runways:
+        return None
     runway = airport.runways[runway_name]
     threshold = next(
         point for point in runway.tuple_runway if point.name == runway_name
@@ -69,12 +72,13 @@ def _landing_in_asma(
         return None
     if selected.duration.total_seconds() < min_duration_sec:
         return None
-    return selected
+    return selected.assign(runway=runway_name)
 
 def _takeoff_in_asma(
     flight: Flight,
     *,
     airport_code: str,
+    allowed_runways: frozenset[str] | None,
     radius_nm: float,
     max_threshold_distance_nm: float,
     min_observations: int,
@@ -88,6 +92,8 @@ def _takeoff_in_asma(
 
     runway_name = takeoff.runway_max
     if runway_name is None:
+        return None
+    if allowed_runways is not None and runway_name not in allowed_runways:
         return None
     
     runway = airport.runways[runway_name]
@@ -115,7 +121,7 @@ def _takeoff_in_asma(
         return None
     if selected.duration.total_seconds() < min_duration_sec:
         return None
-    return selected
+    return selected.assign(runway=runway_name)
 
 def load_source_traffic(source: Path, config: ExperimentConfig) -> Traffic:
     """Load a source Parquet as Traffic, using configured columns if present."""
@@ -144,9 +150,51 @@ def preprocess(
             raise ValueError(f"Could not load preprocessed Traffic: {cache}")
         return t
 
-    t = load_source_traffic(source, config)
+    t = load_source_traffic(source, config).assign_id()
     settings = config.preprocess
     operation = settings.operation
+    allowed_runways = (
+        frozenset(settings.runways) if settings.runways is not None else None
+    )
+    allowed_flows = (
+        frozenset(settings.initial_flows)
+        if settings.initial_flows is not None
+        else None
+    )
+
+    # Flow labels are already flight-level metadata in the Zurich source. Apply
+    # this restriction before the more expensive ASMA and runway checks while
+    # retaining every observation belonging to each selected flight.
+    if allowed_flows is not None:
+        if "initial_flow" not in t.data.columns:
+            raise ValueError(
+                "Source does not contain the initial_flow column required by "
+                f"the configured filter {sorted(allowed_flows)}"
+            )
+        initial_flow = t.data["initial_flow"].astype(str)
+        matching_ids = t.data.loc[
+            initial_flow.isin(allowed_flows), "flight_id"
+        ].unique()
+        t = Traffic(t.data.loc[t.data["flight_id"].isin(matching_ids)].copy())
+        if len(t.data) == 0:
+            raise ValueError(
+                "Source contains no trajectories for initial flows "
+                f"{sorted(allowed_flows)}"
+            )
+
+    # The Zurich source already carries a flight-level runway label. Use it as
+    # a cheap prefilter, then verify the detected runway inside the selector.
+    # Keeping whole flight IDs avoids truncating trajectories with sparse labels.
+    if allowed_runways is not None and "runway" in t.data.columns:
+        runway = t.data["runway"].astype(str)
+        matching_ids = t.data.loc[
+            runway.isin(allowed_runways), "flight_id"
+        ].unique()
+        t = Traffic(t.data.loc[t.data["flight_id"].isin(matching_ids)].copy())
+        if len(t.data) == 0:
+            raise ValueError(
+                f"Source contains no trajectories for runways {sorted(allowed_runways)}"
+            )
 
     # if operation != "landing":
     #     raise ValueError(
@@ -164,9 +212,10 @@ def preprocess(
             f"Unsupported preprocess operation: {operation!r}"
         )
 
-    res = t.assign_id().pipe(
+    res = t.pipe(
         selector,
         airport_code=settings.airport,
+        allowed_runways=allowed_runways,
         radius_nm=settings.radius_nm,
         max_threshold_distance_nm=settings.max_threshold_distance_nm,
         min_observations=settings.min_observations,

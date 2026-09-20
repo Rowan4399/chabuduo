@@ -1,4 +1,4 @@
-"""Standard-prior temporal convolutional variational autoencoder.
+"""Temporal convolutional variational autoencoder.
 
 The temporal blocks and encoder/decoder layout are adapted from the MIT-licensed
 Code Ocean capsule "Deep Generative Modelling of Aircraft Trajectories in
@@ -7,22 +7,39 @@ Terminal Maneuvering Areas", DOI 10.24433/CO.0357574.V1. See NOTICE.md.
 
 from __future__ import annotations
 
+import json
+import shutil
 from collections.abc import Sequence
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import lightning as L
 import numpy as np
 import torch
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.callbacks import (
+    Callback,
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.data import DataLoader, TensorDataset
 
-from chabuduo.artifacts import SplitData
+from chabuduo.artifacts import (
+    SplitData,
+    prepared_artifact_identity,
+    sha256,
+    write_json,
+)
 from chabuduo.config import ExperimentConfig
+
+_CHECKPOINT_MONITOR = "validation/reconstruction_mse"
 
 
 class CausalTemporalBlock(nn.Module):
@@ -145,12 +162,20 @@ class StandardTCVAE(nn.Module):
         dilation_base: int = 2,
         sampling_factor: int = 10,
         dropout: float = 0.2,
+        prior_type: str = "standard",
+        prior_components: int | None = None,
     ) -> None:
         super().__init__()
         if not hidden_channels:
             raise ValueError("hidden_channels cannot be empty")
         if sequence_length % sampling_factor != 0:
             raise ValueError("sequence_length must be divisible by sampling_factor")
+        if prior_type not in {"standard", "vamp"}:
+            raise ValueError(f"Unsupported TCVAE prior: {prior_type}")
+        if prior_type == "vamp" and (
+            prior_components is None or prior_components < 1
+        ):
+            raise ValueError("VampPrior requires at least one component")
 
         self.input_channels = input_channels
         self.sequence_length = sequence_length
@@ -158,6 +183,8 @@ class StandardTCVAE(nn.Module):
         self.latent_dim = latent_dim
         self.sampling_factor = sampling_factor
         self.pooled_length = sequence_length // sampling_factor
+        self.prior_type = prior_type
+        self.prior_components = prior_components if prior_type == "vamp" else None
 
         self.encoder_tcn = TemporalConvNet(
             input_channels,
@@ -187,6 +214,27 @@ class StandardTCVAE(nn.Module):
             dilation_base,
             dropout,
         )
+        if self.prior_type == "vamp":
+            self.pseudo_inputs = nn.Parameter(
+                torch.empty(
+                    int(self.prior_components), input_channels, sequence_length
+                )
+            )
+            nn.init.normal_(self.pseudo_inputs, mean=0.0, std=0.01)
+        else:
+            self.register_parameter("pseudo_inputs", None)
+
+    def initialize_pseudo_inputs(self, values: Tensor) -> None:
+        """Initialize VampPrior pseudo-inputs from normalized training examples."""
+        if self.pseudo_inputs is None:
+            return
+        if values.shape != self.pseudo_inputs.shape:
+            raise ValueError(
+                "Expected pseudo-input initialization with shape "
+                f"{tuple(self.pseudo_inputs.shape)}, got {tuple(values.shape)}"
+            )
+        with torch.no_grad():
+            self.pseudo_inputs.copy_(values.to(self.pseudo_inputs))
 
     def encode(self, value: Tensor) -> tuple[Tensor, Tensor]:
         hidden = self.encoder_pool(self.encoder_tcn(value)).flatten(start_dim=1)
@@ -212,12 +260,45 @@ class StandardTCVAE(nn.Module):
         return reconstruction, mean, log_variance
 
     @staticmethod
-    def kl_divergence(mean: Tensor, log_variance: Tensor) -> Tensor:
-        """Return the mean closed-form KL divergence to N(0, I)."""
-        per_sample = -0.5 * torch.sum(
-            1 + log_variance - mean.square() - log_variance.exp(), dim=1
+    def _diagonal_gaussian_log_prob(
+        value: Tensor, mean: Tensor, log_variance: Tensor
+    ) -> Tensor:
+        return -0.5 * (
+            torch.log(torch.tensor(2 * torch.pi, device=value.device))
+            + log_variance
+            + (value - mean).square() / log_variance.exp()
+        ).sum(dim=-1)
+
+    def prior_parameters(self) -> tuple[Tensor, Tensor]:
+        if self.pseudo_inputs is None:
+            raise RuntimeError("The standard normal prior has no learned components")
+        return self.encode(self.pseudo_inputs)
+
+    def kl_divergence(
+        self,
+        mean: Tensor,
+        log_variance: Tensor,
+        latent: Tensor | None = None,
+    ) -> Tensor:
+        """Return KL to the configured standard or VampPrior distribution."""
+        if self.prior_type == "standard":
+            per_sample = -0.5 * torch.sum(
+                1 + log_variance - mean.square() - log_variance.exp(), dim=1
+            )
+            return per_sample.mean()
+        if latent is None:
+            raise ValueError("VampPrior KL requires a posterior sample")
+        component_mean, component_log_variance = self.prior_parameters()
+        log_q = self._diagonal_gaussian_log_prob(latent, mean, log_variance)
+        log_components = self._diagonal_gaussian_log_prob(
+            latent[:, None, :],
+            component_mean[None, :, :],
+            component_log_variance[None, :, :],
         )
-        return per_sample.mean()
+        log_prior = torch.logsumexp(log_components, dim=1) - torch.log(
+            torch.tensor(log_components.shape[1], device=latent.device)
+        )
+        return (log_q - log_prior).mean()
 
     @torch.inference_mode()
     def sample(
@@ -229,7 +310,20 @@ class StandardTCVAE(nn.Module):
     ) -> Tensor:
         parameter = next(self.parameters())
         target_device = device or parameter.device
-        latent = temperature * torch.randn(count, self.latent_dim, device=target_device)
+        if self.prior_type == "standard":
+            latent = temperature * torch.randn(
+                count, self.latent_dim, device=target_device
+            )
+        else:
+            component_mean, component_log_variance = self.prior_parameters()
+            component = torch.randint(
+                len(component_mean), (count,), device=target_device
+            )
+            mean = component_mean[component]
+            standard_deviation = torch.exp(
+                0.5 * component_log_variance[component]
+            )
+            latent = mean + temperature * standard_deviation * torch.randn_like(mean)
         return self.decode(latent)
 
 
@@ -241,6 +335,7 @@ class TCVAELightning(L.LightningModule):
         self.save_hyperparameters({"resolved_config": resolved_config})
         self.resolved_config = resolved_config
         model = resolved_config["model"]
+        prior = model.get("prior", {"type": "standard"})
         self.network = StandardTCVAE(
             input_channels=int(model["input_channels"]),
             sequence_length=int(model["sequence_length"]),
@@ -250,6 +345,8 @@ class TCVAELightning(L.LightningModule):
             dilation_base=int(model["dilation_base"]),
             sampling_factor=int(model["sampling_factor"]),
             dropout=float(model["dropout"]),
+            prior_type=prior["type"],
+            prior_components=prior.get("components"),
         )
         loss_config = resolved_config["loss"]
         initial_scale = torch.tensor(float(loss_config.get("decoder_scale", 1.0)))
@@ -258,8 +355,14 @@ class TCVAELightning(L.LightningModule):
             requires_grad=bool(loss_config.get("learn_decoder_scale", True)),
         )
 
-    def compute_loss(self, value: Tensor) -> dict[str, Tensor]:
-        reconstruction, mean, log_variance = self.network(value)
+    def _loss_terms(
+        self,
+        value: Tensor,
+        reconstruction: Tensor,
+        mean: Tensor,
+        log_variance: Tensor,
+        latent: Tensor | None = None,
+    ) -> dict[str, Tensor]:
         log_scale = self.log_decoder_scale.clamp_min(-9.21034)
         scale = log_scale.exp()
         gaussian_nll = (
@@ -268,38 +371,118 @@ class TCVAELightning(L.LightningModule):
             + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=value.device))
         )
         reconstruction_loss = gaussian_nll.sum(dim=(1, 2)).mean()
-        kl_loss = self.network.kl_divergence(mean, log_variance)
+        reconstruction_mse = F.mse_loss(reconstruction, value)
+        kl_loss = self.network.kl_divergence(mean, log_variance, latent)
         loss_config = self.resolved_config["loss"]
         loss = (
             float(loss_config["reconstruction_weight"]) * reconstruction_loss
             + float(loss_config["kl_weight"]) * kl_loss
         )
-        return {"loss": loss, "reconstruction": reconstruction_loss, "kl": kl_loss}
+        return {
+            "loss": loss,
+            "reconstruction": reconstruction_loss,
+            "reconstruction_mse": reconstruction_mse,
+            "kl": kl_loss,
+        }
 
-    def _shared_step(self, batch: tuple[Tensor], prefix: str) -> Tensor:
+    def compute_loss(self, value: Tensor) -> dict[str, Tensor]:
+        mean, log_variance = self.network.encode(value)
+        latent = self.network.reparameterize(mean, log_variance)
+        reconstruction = self.network.decode(latent)
+        return self._loss_terms(
+            value, reconstruction, mean, log_variance, latent
+        )
+
+    def compute_validation_loss(
+        self, value: Tensor, *, batch_index: int = 0
+    ) -> dict[str, Tensor]:
+        mean, log_variance = self.network.encode(value)
+        reconstruction = self.network.decode(mean)
+        latent = None
+        if self.network.prior_type == "vamp":
+            generator = torch.Generator(device=value.device).manual_seed(
+                int(self.resolved_config["seed"]) + batch_index
+            )
+            noise = torch.randn(
+                mean.shape,
+                generator=generator,
+                device=mean.device,
+                dtype=mean.dtype,
+            )
+            latent = mean + torch.exp(0.5 * log_variance) * noise
+        return self._loss_terms(
+            value, reconstruction, mean, log_variance, latent
+        )
+
+    def training_step(self, batch: tuple[Tensor], batch_index: int) -> Tensor:
         value = batch[0].permute(0, 2, 1)
         losses = self.compute_loss(value)
         self.log_dict(
-            {f"{prefix}/{name}": item for name, item in losses.items()},
+            {f"train/{name}": item for name, item in losses.items()},
             on_epoch=True,
-            prog_bar=prefix == "validation",
             batch_size=value.shape[0],
         )
         return losses["loss"]
 
-    def training_step(self, batch: tuple[Tensor], batch_index: int) -> Tensor:
-        return self._shared_step(batch, "train")
-
     def validation_step(self, batch: tuple[Tensor], batch_index: int) -> Tensor:
-        return self._shared_step(batch, "validation")
-
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        optimizer = self.resolved_config["optimizer"]
-        return torch.optim.Adam(
-            self.parameters(),
-            lr=float(optimizer["learning_rate"]),
-            weight_decay=float(optimizer.get("weight_decay", 0)),
+        value = batch[0].permute(0, 2, 1)
+        losses = self.compute_validation_loss(value, batch_index=batch_index)
+        self.log_dict(
+            {
+                "validation/checkpoint_loss": losses["loss"],
+                "validation/reconstruction": losses["reconstruction"],
+                "validation/reconstruction_mse": losses["reconstruction_mse"],
+                "validation/kl": losses["kl"],
+            },
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=value.shape[0],
         )
+        return losses["loss"]
+
+    def on_train_epoch_end(self) -> None:
+        scale = self.log_decoder_scale.clamp_min(-9.21034).exp()
+        self.log("model/decoder_scale", scale, on_step=False, on_epoch=True)
+
+    def configure_optimizers(self) -> Any:
+        optimizer_config = self.resolved_config["optimizer"]
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=float(optimizer_config["learning_rate"]),
+            weight_decay=float(optimizer_config.get("weight_decay", 0)),
+        )
+        if optimizer_config.get("lr_plateau_patience") is not None:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=float(optimizer_config["lr_plateau_factor"]),
+                patience=int(optimizer_config["lr_plateau_patience"]),
+                min_lr=float(optimizer_config.get("min_learning_rate", 0.0)),
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": _CHECKPOINT_MONITOR,
+                    "interval": "epoch",
+                    "frequency": 1,
+                },
+            }
+        if optimizer_config.get("lr_step_size") is None:
+            return optimizer
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=int(optimizer_config["lr_step_size"]),
+            gamma=float(optimizer_config["lr_gamma"]),
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     @torch.inference_mode()
     def generate(self, count: int, *, temperature: float = 1.0) -> Tensor:
@@ -316,6 +499,17 @@ def _loader(
         num_workers=workers,
         persistent_workers=workers > 0,
     )
+
+
+class _LearningRateOverride(Callback):
+    def __init__(self, learning_rate: float) -> None:
+        self.learning_rate = learning_rate
+
+    def on_fit_start(self, trainer: L.Trainer, module: L.LightningModule) -> None:
+        del module
+        for optimizer in trainer.optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = self.learning_rate
 
 
 def sample_tcvae(
@@ -342,6 +536,9 @@ def train_tcvae(
     config: ExperimentConfig,
     *,
     smoke: bool,
+    resume: bool = False,
+    additional_epochs: int | None = None,
+    learning_rate: float | None = None,
 ) -> Path:
     """Train a TCVAE from the ready arrays in a prepared artifact."""
     if config.model.type != "tcvae":
@@ -349,8 +546,10 @@ def train_tcvae(
     train_data = SplitData.load(artifact / "train.npz")
     validation_data = SplitData.load(artifact / "validation.npz")
     sequence_length, input_channels = train_data.values.shape[1:]
-    resolved = {
+    current_artifact = prepared_artifact_identity(artifact)
+    configured = {
         "name": config.name,
+        "artifact": current_artifact,
         "model": {
             **config.model.model_dump(exclude={"type", "loss"}),
             "input_channels": input_channels,
@@ -363,15 +562,15 @@ def train_tcvae(
         "smoke": smoke,
     }
     if smoke:
-        resolved["model"] = {
-            **resolved["model"],
+        configured["model"] = {
+            **configured["model"],
             "hidden_channels": [8, 8],
             "latent_dim": 4,
             "kernel_size": 3,
             "dropout": 0.0,
         }
-        resolved["training"] = {
-            **resolved["training"],
+        configured["training"] = {
+            **configured["training"],
             "batch_size": 8,
             "max_epochs": 1,
             "num_workers": 0,
@@ -379,28 +578,134 @@ def train_tcvae(
             "devices": 1,
         }
 
+    resume_path: Path | None = None
+    source_summary: dict[str, Any] | None = None
+    resume_event: dict[str, Any] | None = None
+    if resume:
+        resume_path = output / "checkpoints" / "last.ckpt"
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        resolved = deepcopy(state["hyper_parameters"]["resolved_config"])
+        if resolved["name"] != config.name:
+            raise ValueError(
+                f"Checkpoint belongs to {resolved['name']!r}, not {config.name!r}"
+            )
+        if resolved["artifact"]["sha256"] != current_artifact["sha256"]:
+            raise ValueError("Prepared artifact changed since the run started")
+        source_epoch = int(state["epoch"])
+        completed_epochs = source_epoch + 1
+        target_epochs = (
+            completed_epochs + additional_epochs
+            if additional_epochs is not None
+            else int(config.training.max_epochs)
+        )
+        if target_epochs <= completed_epochs:
+            raise ValueError(
+                "Resume target must exceed the completed epoch count; "
+                "pass --additional-epochs"
+            )
+        resolved["training"]["max_epochs"] = target_epochs
+        backup = output / "resume_sources" / f"epoch-{source_epoch}"
+        backup.mkdir(parents=True, exist_ok=True)
+        for name in ("best.ckpt", "last.ckpt"):
+            source = output / "checkpoints" / name
+            target = backup / name
+            if not target.exists():
+                shutil.copy2(source, target)
+        summary_path = output / "run_summary.json"
+        if summary_path.is_file():
+            source_summary = json.loads(summary_path.read_text(encoding="utf8"))
+            backup_summary = backup / "run_summary.json"
+            if not backup_summary.exists():
+                shutil.copy2(summary_path, backup_summary)
+        resume_event = {
+            "started_at": datetime.now().astimezone().isoformat(),
+            "source_epoch": source_epoch,
+            "source_checkpoint": "checkpoints/last.ckpt",
+            "source_checkpoint_sha256": sha256(backup / "last.ckpt"),
+            "source_backup": str(backup.relative_to(output)),
+            "target_max_epochs": target_epochs,
+            "additional_epochs": target_epochs - completed_epochs,
+            "learning_rate_override": learning_rate,
+        }
+    else:
+        resolved = configured
+
     training = resolved["training"]
-    checkpoint = ModelCheckpoint(
+    best_checkpoint = ModelCheckpoint(
         dirpath=output / "checkpoints",
         filename="best",
-        monitor="validation/loss",
+        monitor=_CHECKPOINT_MONITOR,
         mode="min",
-        save_last=True,
+        save_top_k=1,
+        save_last=False,
+        save_on_train_epoch_end=False,
+        enable_version_counter=False,
     )
+    last_checkpoint = ModelCheckpoint(
+        dirpath=output / "checkpoints",
+        filename="last",
+        monitor=None,
+        save_top_k=1,
+        save_last=False,
+        save_on_train_epoch_end=True,
+        every_n_epochs=1,
+        enable_version_counter=False,
+    )
+    early_stopping = None
+    callbacks: list[Any] = [
+        best_checkpoint,
+        last_checkpoint,
+        LearningRateMonitor(logging_interval="epoch"),
+    ]
+    if training.get("early_stopping_patience") is not None:
+        early_stopping = EarlyStopping(
+            monitor=_CHECKPOINT_MONITOR,
+            mode="min",
+            patience=int(training["early_stopping_patience"]),
+            min_delta=float(training.get("early_stopping_min_delta", 0.0)),
+        )
+        callbacks.append(early_stopping)
+    if learning_rate is not None:
+        if learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
+        callbacks.append(_LearningRateOverride(learning_rate))
+    loggers = [
+        CSVLogger(save_dir=output / "logs", name="training"),
+        TensorBoardLogger(save_dir=output / "logs", name="tensorboard"),
+    ]
     trainer = L.Trainer(
         max_epochs=int(training["max_epochs"]),
         accelerator=training.get("accelerator", "auto"),
         devices=training.get("devices", 1),
-        callbacks=[checkpoint],
-        logger=CSVLogger(save_dir=output / "logs", name="training"),
+        callbacks=callbacks,
+        logger=loggers,
+        gradient_clip_val=training.get("gradient_clip_norm"),
+        gradient_clip_algorithm="norm",
         deterministic=True,
         enable_autolog_hparams=False,
-        enable_progress_bar=True,
+        enable_progress_bar=False,
         limit_train_batches=1 if smoke else 1.0,
         limit_val_batches=1 if smoke else 1.0,
     )
+    module = TCVAELightning(resolved)
+    if not resume and module.network.prior_type == "vamp":
+        prior = resolved["model"]["prior"]
+        if prior.get("initialization") != "train_examples":
+            raise ValueError(
+                f"Unsupported VampPrior initialization: {prior.get('initialization')}"
+            )
+        components = int(prior["components"])
+        if components > len(train_data.values):
+            raise ValueError(
+                "VampPrior components cannot exceed the number of training examples"
+            )
+        generator = np.random.default_rng(int(resolved["seed"]))
+        indices = generator.choice(len(train_data.values), components, replace=False)
+        initial = torch.from_numpy(train_data.values[indices]).permute(0, 2, 1)
+        module.network.initialize_pseudo_inputs(initial)
+    started = perf_counter()
     trainer.fit(
-        TCVAELightning(resolved),
+        module,
         train_dataloaders=_loader(
             train_data,
             int(training["batch_size"]),
@@ -413,5 +718,66 @@ def train_tcvae(
             int(training["num_workers"]),
             False,
         ),
+        ckpt_path=resume_path,
     )
+    runtime_seconds = round(perf_counter() - started, 3)
+    best_path = Path(best_checkpoint.best_model_path)
+    last_path = output / "checkpoints" / "last.ckpt"
+    if not best_path.is_file():
+        best_path = output / "checkpoints" / "best.ckpt"
+    if resume and source_summary is not None and resume_event is not None:
+        previous_score = float(source_summary["best"]["score"])
+        current_score = float(best_checkpoint.best_model_score)
+        if previous_score <= current_score:
+            previous_best = output / resume_event["source_backup"] / "best.ckpt"
+            shutil.copy2(previous_best, output / "checkpoints" / "best.ckpt")
+            best_path = output / "checkpoints" / "best.ckpt"
+            best_score = previous_score
+        else:
+            best_score = current_score
+    else:
+        best_score = float(best_checkpoint.best_model_score)
+    best_state = torch.load(best_path, map_location="cpu", weights_only=False)
+    last_state = torch.load(last_path, map_location="cpu", weights_only=False)
+    if source_summary is None:
+        previous_resumes = []
+    else:
+        previous_resumes = source_summary.get("resumes", [])
+        if not previous_resumes and "resume" in source_summary:
+            previous_resumes = [source_summary["resume"]]
+    if resume_event is not None:
+        resume_event["finished_at"] = datetime.now().astimezone().isoformat()
+        resume_event["last_epoch"] = int(last_state["epoch"])
+    summary = {
+        "schema_version": 1,
+        "status": "complete",
+        "model_type": "tcvae",
+        "config_name": config.name,
+        "artifact": current_artifact,
+        "monitor": _CHECKPOINT_MONITOR,
+        "best": {
+            "path": str(best_path.relative_to(output)),
+            "epoch": int(best_state["epoch"]),
+            "global_step": int(best_state["global_step"]),
+            "score": best_score,
+            "sha256": sha256(best_path),
+        },
+        "last": {
+            "path": str(last_path.relative_to(output)),
+            "epoch": int(last_state["epoch"]),
+            "global_step": int(last_state["global_step"]),
+            "sha256": sha256(last_path),
+        },
+        "stopped_early": bool(
+            early_stopping is not None and early_stopping.stopped_epoch > 0
+        ),
+        "final_learning_rate": float(trainer.optimizers[0].param_groups[0]["lr"]),
+        "runtime_seconds": runtime_seconds,
+        "finished_at": datetime.now().astimezone().isoformat(),
+        "resumes": [
+            *previous_resumes,
+            *([] if resume_event is None else [resume_event]),
+        ],
+    }
+    write_json(output / "run_summary.json", summary)
     return output

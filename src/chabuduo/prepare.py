@@ -122,6 +122,19 @@ def _ids(t: Traffic) -> np.ndarray:
     )
 
 
+def _metadata_value(flight: Flight, column: str) -> object:
+    """Return one flight-level metadata value, rejecting ambiguous labels."""
+    if column not in flight.data.columns:
+        raise ValueError(f"Missing requested metadata column: {column!r}")
+    values = flight.data[column].drop_duplicates()
+    if len(values) != 1:
+        flight_id = getattr(flight, "flight_id", "unknown")
+        raise ValueError(
+            f"Metadata column {column!r} is not constant for flight {flight_id!r}"
+        )
+    return values.iloc[0]
+
+
 def prepare(
     selected: Path,
     output: Path,
@@ -157,7 +170,7 @@ def prepare(
     generation.fit_preprocessing(splits["train"])
 
     prepared: dict[str, SplitData] = {}
-    records: list[dict[str, str]] = []
+    records: list[dict[str, object]] = []
     for name, t in splits.items():
         matrix = generation.transform_features(t)
         feature_count = len(features)
@@ -176,10 +189,18 @@ def prepare(
             trajectory_id=identifiers,
             split_group_id=identifiers.copy(),
         )
-        records.extend(
-            {"trajectory_id": identifier, "split": name}
-            for identifier in identifiers
-        )
+        for identifier, flight in zip(identifiers, t, strict=True):
+            record: dict[str, object] = {
+                "trajectory_id": identifier,
+                "split": name,
+            }
+            record.update(
+                {
+                    column: _metadata_value(flight, column)
+                    for column in settings.metadata_columns
+                }
+            )
+            records.append(record)
 
     if scaler.normalization is None:
         raise RuntimeError("Generation scaler was not fitted")

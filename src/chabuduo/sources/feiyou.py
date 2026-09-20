@@ -87,8 +87,7 @@ def discover_files(
                 f"does not exist: {directory}"
             )
         range_dates = {
-            start + timedelta(days=offset)
-            for offset in range((end - start).days + 1)
+            start + timedelta(days=offset) for offset in range((end - start).days + 1)
         }
 
         overlap = expected_dates & range_dates
@@ -131,15 +130,15 @@ def discover_files(
 
 
 def _drop_duplicate_observations(
-    chunk: pd.DataFrame, seen: set[int], previous_seen:set[int],
+    chunk: pd.DataFrame,
+    seen: set[int],
+    previous_seen: set[int],
 ) -> tuple[pd.DataFrame, int]:
     """Keep the first row for each aircraft timestamp in one daily file."""
     addresses = pd.to_numeric(chunk["icao"], errors="raise").astype("int64")
     if ((addresses < 0) | (addresses > 0xFFFFFF)).any():
         raise ValueError("Feiyou icao values must fit in a 24-bit address")
-    timestamps = pd.to_numeric(
-        chunk["position_time"], errors="raise"
-    ).astype("int64")
+    timestamps = pd.to_numeric(chunk["position_time"], errors="raise").astype("int64")
     keep: list[bool] = []
     for address, timestamp in zip(addresses, timestamps, strict=True):
         # ICAO addresses use 24 bits, so this packs both integers exactly.
@@ -163,8 +162,7 @@ def _convert_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
             "longitude": pd.to_numeric(chunk["lng"], errors="raise"),
             "altitude": pd.to_numeric(chunk["altitude"], errors="raise")
             * METERS_TO_FEET,
-            "groundspeed": pd.to_numeric(chunk["speed"], errors="raise")
-            * MPS_TO_KNOTS,
+            "groundspeed": pd.to_numeric(chunk["speed"], errors="raise") * MPS_TO_KNOTS,
             "vertical_rate": pd.to_numeric(chunk["ver_speed"], errors="raise")
             * MPS_TO_FEET_PER_MINUTE,
             "heading": pd.to_numeric(chunk["heading"], errors="raise"),
@@ -206,7 +204,11 @@ def convert_files(
                 )
                 for chunk in chunks:
                     source_input_rows += len(chunk)
-                    chunk, duplicates = _drop_duplicate_observations(chunk,seen,previous_seen,)
+                    chunk, duplicates = _drop_duplicate_observations(
+                        chunk,
+                        seen,
+                        previous_seen,
+                    )
                     source_duplicates += duplicates
                     converted = _convert_chunk(chunk)
                     table = pa.Table.from_pandas(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,13 @@ from traffic.algorithms.generation import Generation as TrafficGeneration
 from traffic.core import Traffic
 from traffic.data import airports
 
-from chabuduo.artifacts import Normalization, SplitData
+from chabuduo.artifacts import (
+    Normalization,
+    SplitData,
+    prepared_artifact_identity,
+    sha256,
+    write_json,
+)
 from chabuduo.config import ExperimentConfig
 from chabuduo.models.ddpm import sample_ddpm
 from chabuduo.models.tcvae import sample_tcvae
@@ -27,9 +34,7 @@ def _kinematic_matrix(
     config: ExperimentConfig,
 ) -> np.ndarray:
     if {"track_sin", "track_cos"} <= channels.keys():
-        track = np.degrees(
-            np.arctan2(channels["track_sin"], channels["track_cos"])
-        )
+        track = np.degrees(np.arctan2(channels["track_sin"], channels["track_cos"]))
     elif "track_unwrapped" in channels:
         track = channels["track_unwrapped"]
     else:
@@ -54,9 +59,7 @@ def _kinematic_matrix(
         minimum_speed, maximum_speed = 0, 600
         minimum_altitude, maximum_altitude = -1000, 60000
     result[:, :, 1] = np.clip(result[:, :, 1], minimum_speed, maximum_speed)
-    result[:, :, 2] = np.clip(
-        result[:, :, 2], minimum_altitude, maximum_altitude
-    )
+    result[:, :, 2] = np.clip(result[:, :, 2], minimum_altitude, maximum_altitude)
     elapsed = result[:, :, 3] - result[:, :1, 3]
     increments = np.diff(elapsed, axis=1, prepend=elapsed[:, :1])
     increments[:, 0] = 0
@@ -83,9 +86,7 @@ def build_generated_traffic(
             ),
             axis=2,
         )
-        adapter = TrafficGeneration(
-            None, ["x", "y", "altitude", "timedelta"]
-        )
+        adapter = TrafficGeneration(None, ["x", "y", "altitude", "timedelta"])
         return adapter.build_traffic(
             matrix.reshape(len(values), -1), projection=projection
         )
@@ -93,15 +94,26 @@ def build_generated_traffic(
     airport = airports[config.preprocess.airport]
     if airport is None:
         raise ValueError(f"Unknown airport: {config.preprocess.airport}")
+    latitude = airport.latitude
+    longitude = airport.longitude
+    if config.prepare.representation.anchor == "runway_threshold":
+        runways = config.preprocess.runways
+        if runways is None or len(runways) != 1:
+            raise ValueError("runway_threshold anchor requires exactly one runway")
+        runway_name = runways[0]
+        runway = airport.runways[runway_name]
+        threshold = next(
+            point for point in runway.tuple_runway if point.name == runway_name
+        )
+        latitude = threshold.latitude
+        longitude = threshold.longitude
     matrix = _kinematic_matrix(channels, elapsed_time, config)
-    adapter = TrafficGeneration(
-        None, ["track", "groundspeed", "altitude", "timedelta"]
-    )
+    adapter = TrafficGeneration(None, ["track", "groundspeed", "altitude", "timedelta"])
     return adapter.build_traffic(
         matrix.reshape(len(values), -1),
         coordinates={
-            "latitude": airport.latitude,
-            "longitude": airport.longitude,
+            "latitude": latitude,
+            "longitude": longitude,
         },
         forward=False,
     )
@@ -111,7 +123,7 @@ def _normalized_samples(
     run: Path,
     artifact: Path,
     config: ExperimentConfig,
-) -> tuple[np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray | None, Path]:
     count = config.sampling.count
     if config.model.type == "tcvae" and config.sampling.type == "tcvae":
         checkpoint = run / "checkpoints" / "best.ckpt"
@@ -124,6 +136,7 @@ def _normalized_samples(
                 temperature=config.sampling.temperature,
             ),
             None,
+            checkpoint,
         )
 
     if config.model.type == "ddpm" and config.sampling.type == "ddpm":
@@ -131,7 +144,7 @@ def _normalized_samples(
         if not checkpoint.exists():
             raise FileNotFoundError(checkpoint)
         if config.model.conditioning is None:
-            condition_ids = np.zeros(count, dtype=np.int64)
+            condition_ids = None
         else:
             metadata = pd.read_parquet(artifact / "metadata.parquet")
             feature = config.model.conditioning.feature
@@ -147,12 +160,14 @@ def _normalized_samples(
         return (
             sample_ddpm(
                 checkpoint,
-                condition_ids,
+                count,
                 config.prepare.points,
                 steps=config.sampling.steps,
                 eta=config.sampling.eta,
+                condition_ids=condition_ids,
             ),
             condition_ids,
+            checkpoint,
         )
     raise ValueError("Model and sampling types do not match")
 
@@ -177,7 +192,7 @@ def sample_run(
         raise FileExistsError(f"{output} already exists")
 
     torch.manual_seed(seed)
-    normalized, condition_ids = _normalized_samples(run, artifact, config)
+    normalized, condition_ids, checkpoint = _normalized_samples(run, artifact, config)
     output.mkdir(parents=True)
     normalization = Normalization.load(artifact / "normalization.json")
     values = normalization.inverse_transform(normalized)
@@ -198,16 +213,34 @@ def sample_run(
     frame["elapsed_time"] = frame["timedelta"].to_numpy()
     for name, channel in channels.items():
         frame[name] = channel.ravel()
+    if config.preprocess.runways is not None and len(config.preprocess.runways) == 1:
+        frame["runway"] = config.preprocess.runways[0]
     if condition_ids is not None:
-        frame["model_condition_id"] = np.repeat(
-            condition_ids, config.prepare.points
-        )
-    elapsed_time = frame["elapsed_time"].to_numpy(dtype=np.float32).reshape(
-        count, -1
-    )
+        frame["model_condition_id"] = np.repeat(condition_ids, config.prepare.points)
+    elapsed_time = frame["elapsed_time"].to_numpy(dtype=np.float32).reshape(count, -1)
     arrays = {"values": values, "elapsed_time": elapsed_time}
     if condition_ids is not None:
         arrays["model_condition_id"] = condition_ids
     np.savez_compressed(output / "samples.npz", **arrays)
     frame.to_parquet(output / "generated.parquet", index=False)
+    write_json(
+        output / "sample_summary.json",
+        {
+            "schema_version": 1,
+            "model_type": config.model.type,
+            "config_name": config.name,
+            "run": str(run.resolve()),
+            "artifact": prepared_artifact_identity(artifact),
+            "checkpoint": {
+                "path": str(checkpoint.resolve()),
+                "sha256": sha256(checkpoint),
+            },
+            "count": count,
+            "seed": seed,
+            "feature_order": config.prepare.representation.features,
+            "sequence_length": config.prepare.points,
+            "created_at": datetime.now().astimezone().isoformat(),
+            "outputs": ["samples.npz", "generated.parquet"],
+        },
+    )
     return output

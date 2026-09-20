@@ -30,23 +30,50 @@ def train(
     config: ExperimentConfig,
     *,
     smoke: bool = False,
+    resume: bool = False,
+    additional_epochs: int | None = None,
+    learning_rate: float | None = None,
 ) -> Path:
     """Dispatch training to the model selected in the experiment YAML."""
     validate_artifact(artifact, config)
-    if output.exists():
+    if not resume and (additional_epochs is not None or learning_rate is not None):
+        raise ValueError("--additional-epochs and --learning-rate require --resume")
+    if output.exists() and not resume:
         raise FileExistsError(f"{output} already exists")
-    output.mkdir(parents=True)
-    (output / "environment.json").write_text(
-        json.dumps(_environment(), indent=2) + "\n", encoding="utf8"
-    )
+    if resume:
+        suffix = "ckpt" if config.model.type == "tcvae" else "pt"
+        checkpoint = output / "checkpoints" / f"last.{suffix}"
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"No resumable checkpoint at {checkpoint}")
+    else:
+        output.mkdir(parents=True)
+        (output / "environment.json").write_text(
+            json.dumps(_environment(), indent=2) + "\n", encoding="utf8"
+        )
     L.seed_everything(config.training.seed, workers=True)
 
     if config.model.type == "tcvae":
         from chabuduo.models.tcvae import train_tcvae
 
-        return train_tcvae(artifact, output, config, smoke=smoke)
+        return train_tcvae(
+            artifact,
+            output,
+            config,
+            smoke=smoke,
+            resume=resume,
+            additional_epochs=additional_epochs,
+            learning_rate=learning_rate,
+        )
     if config.model.type == "ddpm":
         from chabuduo.models.ddpm import train_ddpm
 
-        return train_ddpm(artifact, output, config, smoke=smoke)
+        return train_ddpm(
+            artifact,
+            output,
+            config,
+            smoke=smoke,
+            resume=resume,
+            additional_epochs=additional_epochs,
+            learning_rate=learning_rate,
+        )
     raise ValueError(f"Unsupported model type: {config.model.type}")
