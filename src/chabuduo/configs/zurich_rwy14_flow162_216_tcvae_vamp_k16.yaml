@@ -1,0 +1,78 @@
+name: zurich_rwy14_flow162_216_tcvae_vamp_k16
+dataset: zurich
+version: v1
+
+source:
+  type: traffic_dataset
+  dataset: landing_zurich_2019
+  filename: landing_zurich_2019.parquet
+
+preprocess:
+  operation: landing
+  airport: LSZH
+  runways: ["14"]
+  initial_flows: ["162-216"]
+  radius_nm: 40
+  max_threshold_distance_nm: 0.1
+  min_observations: 10
+  min_duration_sec: 600
+
+prepare:
+  points: 200
+  metadata_columns: [runway, initial_flow, simple]
+  representation:
+    name: kinematic_200
+    features: [track_unwrapped, groundspeed_kt, altitude_ft, elapsed_time_sec]
+    units: [degree, knot, ft, s]
+    direction: chronological
+    anchor: runway_threshold
+  split:
+    group_by: flight_id
+    train: 0.70
+    validation: 0.15
+    test: 0.15
+    seed: 42
+  normalization:
+    method: standard_per_timestep
+    fit_on: train
+
+model:
+  type: tcvae
+  hidden_channels: [64, 64, 64]
+  latent_dim: 64
+  kernel_size: 16
+  dilation_base: 2
+  sampling_factor: 10
+  dropout: 0.2
+  prior:
+    type: vamp
+    components: 16
+    initialization: train_examples
+  loss:
+    reconstruction_weight: 1.0
+    kl_weight: 1.0
+    decoder_scale: 1.0
+    learn_decoder_scale: true
+
+optimizer:
+  learning_rate: 0.001
+  lr_plateau_patience: 4
+  lr_plateau_factor: 0.5
+  min_learning_rate: 0.00001
+
+training:
+  seed: 42
+  batch_size: 128
+  max_epochs: 300
+  num_workers: 4
+  accelerator: auto
+  devices: 1
+  gradient_clip_norm: 0.5
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0
+
+sampling:
+  type: tcvae
+  count: 500
+  seed: 42
+  temperature: 1.0
