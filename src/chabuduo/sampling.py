@@ -19,6 +19,7 @@ from chabuduo.artifacts import (
 )
 from chabuduo.config import ExperimentConfig
 from chabuduo.models.ddpm import sample_ddpm
+from chabuduo.models.latent_ddpm import sample_latent_ddpm
 from chabuduo.models.tcvae import sample_tcvae
 from chabuduo.prepare import airport_projection
 
@@ -50,7 +51,7 @@ def _kinematic_matrix(
 
     result = np.stack((track, groundspeed, altitude, elapsed_time), axis=2)
     result[:, :, 0] %= 360
-    if config.sampling.type == "ddpm":
+    if config.sampling.type in {"ddpm", "latent_ddpm"}:
         minimum_speed = config.sampling.minimum_groundspeed_kt
         maximum_speed = config.sampling.maximum_groundspeed_kt
         minimum_altitude = config.sampling.minimum_altitude_ft
@@ -123,7 +124,7 @@ def _normalized_samples(
     run: Path,
     artifact: Path,
     config: ExperimentConfig,
-) -> tuple[np.ndarray, np.ndarray | None, Path]:
+) -> tuple[np.ndarray, np.ndarray | None, Path, dict[str, np.ndarray]]:
     count = config.sampling.count
     if config.model.type == "tcvae" and config.sampling.type == "tcvae":
         checkpoint = run / "checkpoints" / "best.ckpt"
@@ -137,6 +138,7 @@ def _normalized_samples(
             ),
             None,
             checkpoint,
+            {},
         )
 
     if config.model.type == "ddpm" and config.sampling.type == "ddpm":
@@ -168,6 +170,26 @@ def _normalized_samples(
             ),
             condition_ids,
             checkpoint,
+            {},
+        )
+    if config.model.type == "latent_ddpm" and config.sampling.type == "latent_ddpm":
+        checkpoint = run / "checkpoints" / "best.pt"
+        if not checkpoint.exists():
+            raise FileNotFoundError(checkpoint)
+        normalized, latent, standardized = sample_latent_ddpm(
+            checkpoint,
+            count,
+            steps=config.sampling.steps,
+            eta=config.sampling.eta,
+        )
+        return (
+            normalized,
+            None,
+            checkpoint,
+            {
+                "generated_latent": latent,
+                "generated_latent_standardized": standardized,
+            },
         )
     raise ValueError("Model and sampling types do not match")
 
@@ -185,14 +207,16 @@ def sample_run(
     suffix = f"seed-{seed}-n-{count}"
     if config.sampling.type == "tcvae" and config.sampling.temperature != 1.0:
         suffix += f"-t-{config.sampling.temperature:g}"
-    if config.sampling.type == "ddpm":
+    if config.sampling.type in {"ddpm", "latent_ddpm"}:
         suffix += f"-steps-{config.sampling.steps}-eta-{config.sampling.eta:g}"
     output = output or run / "samples" / suffix
     if output.exists():
         raise FileExistsError(f"{output} already exists")
 
     torch.manual_seed(seed)
-    normalized, condition_ids, checkpoint = _normalized_samples(run, artifact, config)
+    normalized, condition_ids, checkpoint, extra_arrays = _normalized_samples(
+        run, artifact, config
+    )
     output.mkdir(parents=True)
     normalization = Normalization.load(artifact / "normalization.json")
     values = normalization.inverse_transform(normalized)
@@ -219,6 +243,7 @@ def sample_run(
         frame["model_condition_id"] = np.repeat(condition_ids, config.prepare.points)
     elapsed_time = frame["elapsed_time"].to_numpy(dtype=np.float32).reshape(count, -1)
     arrays = {"values": values, "elapsed_time": elapsed_time}
+    arrays.update(extra_arrays)
     if condition_ids is not None:
         arrays["model_condition_id"] = condition_ids
     np.savez_compressed(output / "samples.npz", **arrays)

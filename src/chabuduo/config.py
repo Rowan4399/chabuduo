@@ -214,8 +214,44 @@ class DDPMModelSettings(StrictModel):
         return self
 
 
+class AutoencoderReferenceSettings(StrictModel):
+    run: str
+    checkpoint: str
+    prepared_artifact: str
+    expected_epoch: int = Field(ge=0)
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_prior: Literal["standard", "vamp"]
+
+
+class LatentRepresentationSettings(StrictModel):
+    dimension: PositiveInt
+    representation: Literal["posterior_sample"]
+    seed: int
+    standardization: Literal["per_dimension_train"]
+
+
+class LatentDDPMModelSettings(StrictModel):
+    type: Literal["latent_ddpm"]
+    architecture: Literal["residual_mlp"]
+    autoencoder: AutoencoderReferenceSettings
+    latent: LatentRepresentationSettings
+    hidden_dim: PositiveInt
+    residual_blocks: PositiveInt
+    dropout: float = Field(default=0.0, ge=0, lt=1)
+    time_embedding_dim: PositiveInt
+    diffusion_steps: PositiveInt
+    beta_schedule: Literal["linear"] = "linear"
+    prediction: Literal["noise"]
+
+    @model_validator(mode="after")
+    def timestep_embedding_is_even(self) -> LatentDDPMModelSettings:
+        if self.time_embedding_dim % 2:
+            raise ValueError("time_embedding_dim must be even")
+        return self
+
+
 ModelSettings = Annotated[
-    TCVAEModelSettings | DDPMModelSettings,
+    TCVAEModelSettings | DDPMModelSettings | LatentDDPMModelSettings,
     Field(discriminator="type"),
 ]
 
@@ -275,8 +311,20 @@ class DDPMSamplingSettings(StrictModel):
     maximum_altitude_ft: float
 
 
+class LatentDDPMSamplingSettings(StrictModel):
+    type: Literal["latent_ddpm"]
+    count: PositiveInt
+    seed: int
+    steps: PositiveInt
+    eta: float = Field(default=0, ge=0, le=1)
+    minimum_groundspeed_kt: float
+    maximum_groundspeed_kt: float
+    minimum_altitude_ft: float
+    maximum_altitude_ft: float
+
+
 SamplingSettings = Annotated[
-    TCVAESamplingSettings | DDPMSamplingSettings,
+    TCVAESamplingSettings | DDPMSamplingSettings | LatentDDPMSamplingSettings,
     Field(discriminator="type"),
 ]
 
@@ -336,6 +384,9 @@ def selected_path(config: ExperimentConfig) -> Path:
 
 
 def prepared_path(config: ExperimentConfig) -> Path:
+    if config.model.type == "latent_ddpm":
+        path = Path(config.model.autoencoder.prepared_artifact)
+        return path if path.is_absolute() else PROJECT_ROOT / path
     return PROJECT_ROOT / "data" / "processed" / f"{config.name}-{config.version}"
 
 
@@ -353,7 +404,7 @@ def sample_path(config: ExperimentConfig, run: Path) -> Path:
     suffix = f"seed-{sampling.seed}-n-{sampling.count}"
     if sampling.type == "tcvae" and sampling.temperature != 1.0:
         suffix += f"-t-{sampling.temperature:g}"
-    if sampling.type == "ddpm":
+    if sampling.type in {"ddpm", "latent_ddpm"}:
         suffix += f"-steps-{sampling.steps}-eta-{sampling.eta:g}"
     return run / "samples" / suffix
 

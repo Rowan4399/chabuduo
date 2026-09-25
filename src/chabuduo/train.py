@@ -76,4 +76,16 @@ def train(
             additional_epochs=additional_epochs,
             learning_rate=learning_rate,
         )
+    if config.model.type == "latent_ddpm":
+        from chabuduo.models.latent_ddpm import train_latent_ddpm
+
+        return train_latent_ddpm(
+            artifact,
+            output,
+            config,
+            smoke=smoke,
+            resume=resume,
+            additional_epochs=additional_epochs,
+            learning_rate=learning_rate,
+        )
     raise ValueError(f"Unsupported model type: {config.model.type}")
