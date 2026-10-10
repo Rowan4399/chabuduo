@@ -163,6 +163,18 @@ It checks required files, declared shapes and units, finite and chronological
 values, normalization metadata, identifiers, metadata consistency, and split
 leakage. It exits with a nonzero status when training should not proceed.
 
+## Code and run directories
+
+`src/chabuduo/` contains the supported package implementation. `scripts/`
+contains thin command-line entry points and exploratory ideas, including
+evaluation calculations that are not ready to become package code.
+
+`runs/` stores model training information and its outputs. Evaluation scripts
+read those artifacts from `scripts/`; do not copy executable scripts into each
+run. Existing evaluation data and figures keep their paths during this move.
+Historical source versions are preserved under `scripts/archive/`, with the
+old-to-new paths listed in `scripts/MOVED_FROM_RUNS.md`.
+
 ## Artifacts
 
 Prepared datasets contain only ready tensors and their numerical metadata:

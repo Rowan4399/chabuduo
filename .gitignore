@@ -12,3 +12,6 @@ data/*
 !data/README.md
 runs/*
 !runs/README.md
+
+# Generated browser snapshot with embedded evaluation data.
+scripts/archive/rwy14-review-v1/source/page-check.js

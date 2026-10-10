@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Keep historical source bytes identical to recorded hashes.
+scripts/archive/** -text
