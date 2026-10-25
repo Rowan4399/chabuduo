@@ -24,9 +24,84 @@ Areas](https://doi.org/10.24433/CO.0357574.V1). See [NOTICE.md](NOTICE.md).
 
 ## Current state
 
-The CLI and artifact path work for Beijing and Zurich. The only implemented
-model is an unconditional, standard-prior temporal convolutional VAE. It does
+The package contains the TCVAE, the conditional trajectory DDPM, and latent
+DDPM training/sampling. The latent DDPM path reuses a frozen TCVAE and its exact
+prepared splits; see the commands below. Frozen standard-prior and VampPrior
+TCVAE checkpoints can both be loaded. The historical Beijing TCVAE runs do
 **not yet generate convincing unconditional Beijing trajectories**.
+
+## Latent DDPM
+
+The supported implementation is `src/chabuduo/models/latent_ddpm.py`, recovered
+from the matching local snapshots under
+`output/support/conditional-three-models-20261018/remote-source-before/` and
+`scripts/archive/latent_denoising_video-v1-seed-42/source/`. Their latent model
+sources were identical. The older `.remote_*/scripts/train_latent_ddpm.py`
+experiment used posterior means and temporal convolutions; it is not this model.
+
+The fixed design encodes each complete `[200, 4]` trajectory as a 64-dimensional
+posterior **sample**, standardizes each latent dimension using training data
+only, and trains a residual MLP (width 256, four blocks, timestep embedding 128).
+It uses 1,000 linear diffusion steps, noise MSE, AdamW, StepLR, and EMA. The YAML
+pins the TCVAE checkpoint epoch, SHA-256, prior, and prepared artifact. No
+TCVAE retraining or upstream cache recomputation is required.
+
+Three bundled experiments retain their original parameters:
+
+| Experiment | Frozen TCVAE | Prepared artifact |
+|---|---|---|
+| `tianjin_noaib_rwy16l_latent_ddpm_vamp_k1000` | VampPrior K1000, epoch 262 | `tianjin_noaib_rwy16l_tcvae_vamp_k1000-v1` |
+| `zurich_rwy14_latent_ddpm_vamp_k1000` | VampPrior K1000, epoch 240 | `zurich_rwy14_tcvae_vamp_k1000-v1` |
+| `zurich_rwy14_flow162_216_latent_ddpm_mlp` | standard prior, epoch 354 | `zurich_rwy14_flow162_216_tcvae-v1` |
+
+Each requires the referenced files to exist locally. On this checkout, the
+Tianjin prepared artifact and both trained checkpoints are available. The
+default `.venv` lacks PyTorch; the existing `.venv-video` CPU environment now
+has the package and test dependencies installed. Select it in PowerShell:
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = "$PWD/.venv-video"
+$env:UV_CACHE_DIR = "$PWD/.uv-task-cache"
+$env:TRAFFIC_CACHE_PATH = "$PWD/data/cache/traffic"
+```
+
+The local Traffic cache contains airport and runway metadata. Use a new output
+directory when testing, because existing runs and samples are preserved:
+
+```powershell
+uv run --no-sync chabuduo prepare tianjin_noaib_rwy16l_latent_ddpm_vamp_k1000
+uv run --no-sync chabuduo validate tianjin_noaib_rwy16l_latent_ddpm_vamp_k1000
+uv run --no-sync chabuduo train tianjin_noaib_rwy16l_latent_ddpm_vamp_k1000 --smoke --output runs/latent-ddpm-local-smoke
+uv run --no-sync chabuduo sample tianjin_noaib_rwy16l_latent_ddpm_vamp_k1000 --run runs/latent-ddpm-local-smoke --output runs/latent-ddpm-local-smoke/samples/review
+uv run --no-sync chabuduo plot tianjin_noaib_rwy16l_latent_ddpm_vamp_k1000 --sample runs/latent-ddpm-local-smoke/samples/review
+uv run --no-sync chabuduo plot-loss runs/latent-ddpm-local-smoke
+```
+
+For latent DDPM, `prepare` checks and returns the referenced TCVAE artifact. It
+does not split, normalize, or encode it again. `train` creates
+`artifacts/latent_dataset.npz`, `latent_normalization.json`, and
+`latent_manifest.json`, then writes `checkpoints/best.pt`, `last.pt`, CSV metrics,
+the environment, the consumed configuration, and a run summary. `--smoke` uses
+up to eight trajectories per split, a smaller MLP, and one CPU training batch
+and validation batch. Its outputs only check the implementation path.
+
+Resume the same smoke run without encoding the latent cache again:
+
+```powershell
+uv run --no-sync chabuduo train tianjin_noaib_rwy16l_latent_ddpm_vamp_k1000 --smoke --output runs/latent-ddpm-local-smoke --resume --additional-epochs 1
+```
+
+For a formal run, commit its YAML first, choose a fresh `--output`, and omit
+`--smoke` to use the declared 500-epoch budget. Always resume with the same
+smoke/formal mode. `--learning-rate` optionally overrides the optimizer rate
+when resuming. Previous checkpoints are retained under `resume_sources/`.
+Sampling selects `best.pt`, uses its EMA weights when present, decodes through
+the pinned TCVAE, and retains both raw and standardized generated latent vectors
+in `samples.npz`. Geographic reconstruction anchors at the configured runway
+threshold; `sample_summary.json` records clipping and elapsed-time repair;
+this does not establish physical realism.
+
+## Historical Beijing experiments
 
 Three historical Beijing runs remain useful evidence. Their directory names
 predate the current single-config workflow:
@@ -228,7 +303,8 @@ likely choices are conditioning by runway/flow or changing the latent prior.
 Conditional DDPM training and sampling are available, but preparation still
 needs the `model_condition_id` flow labels. DDPM sampling balances the requested
 total sample count across the condition IDs present in the training split.
-Flow matching, VampPrior, and a full evaluation registry remain future work.
+Flow matching and a full evaluation registry remain future work. Frozen
+VampPrior checkpoints are supported by the latent DDPM path above.
 
 ## Tests
 

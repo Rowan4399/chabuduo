@@ -11,10 +11,18 @@ the result, print the output path, and stop.
 
 ## Shared entry points
 
-- `plot_samples.py` calls the package trajectory plotter.
-- `plot_loss.py` calls the package loss plotter.
+- `plot_samples.py` handles exploratory trajectory plots.
+- `plot_loss.py` handles exploratory training loss plots.
 - The `chabuduo` CLI remains the interface for get, preprocess, prepare,
   validate, train, sample, and plot.
+- Latent DDPM training and sampling live in
+  `src/chabuduo/models/latent_ddpm.py`; use `chabuduo train ... --smoke`,
+  `train ... --resume`, `sample`, `plot`, and `plot-loss` as documented in the
+  root README. No training implementation is copied into `scripts/`.
+- `latent_denoising_video.py` only records sampler states and renders videos.
+  It imports the package model and records the hashes of the source it uses.
+- `.remote_*/scripts/train_latent_ddpm.py` is an older posterior-mean/convolution
+  experiment. Keep it as historical context; it is not the residual MLP trainer.
 
 ## Evaluation tools moved from runs
 

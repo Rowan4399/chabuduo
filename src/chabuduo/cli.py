@@ -18,7 +18,6 @@ from chabuduo.config import (
     selected_path,
 )
 from chabuduo.get import resolve_traffic_dataset, stage_dataset
-from chabuduo.plotting import plot_samples
 from chabuduo.prepare import prepare
 from chabuduo.preprocess import preprocess
 from chabuduo.sampling import sample_run
@@ -106,6 +105,16 @@ def prepare_command(
 ) -> None:
     """Create split, normalized, ready-to-train numerical tensors."""
     configuration = _experiment_config(experiment, config)
+    if configuration.model.type == "latent_ddpm":
+        if selected is not None or output is not None:
+            raise typer.BadParameter(
+                "latent_ddpm reuses autoencoder.prepared_artifact; "
+                "prepare the TCVAE dataset separately"
+            )
+        result = prepared_path(configuration)
+        validate_artifact(result, configuration)
+        typer.echo(f"OUTPUT={result}")
+        return
     result = prepare(
         selected or selected_path(configuration),
         output or prepared_path(configuration),
@@ -132,7 +141,8 @@ def validate_command(
         typer.echo(f"ERROR: {error}", err=True)
         raise typer.Exit(code=1) from error
     for message in messages:
-        typer.echo(f"✓ {message}")
+        typer.echo(f"OK {message}")
+    typer.echo(f"ARTIFACT={artifact or prepared_path(configuration)}")
 
 
 @app.command("train")
@@ -146,6 +156,15 @@ def train_command(
     smoke: Annotated[
         bool, typer.Option(help="Run one tiny CPU epoch to test the complete path")
     ] = False,
+    resume: Annotated[
+        bool, typer.Option(help="Resume a latent DDPM run from checkpoints/last.pt")
+    ] = False,
+    additional_epochs: Annotated[
+        int | None, typer.Option(min=1, help="Extra epochs after --resume")
+    ] = None,
+    learning_rate: Annotated[
+        float | None, typer.Option(min=0, help="Override learning rate on --resume")
+    ] = None,
 ) -> None:
     """Train the model selected by the experiment configuration."""
     configuration = _experiment_config(experiment, config)
@@ -154,6 +173,9 @@ def train_command(
         output or run_path(configuration, smoke=smoke),
         configuration,
         smoke=smoke,
+        resume=resume,
+        additional_epochs=additional_epochs,
+        learning_rate=learning_rate,
     )
     typer.echo(f"RUN={result}")
 
@@ -194,7 +216,9 @@ def plot_command(
     output: Annotated[Path | None, typer.Option(help="PNG output path")] = None,
     config: ConfigOption = None,
 ) -> None:
-    """Plot held-out and generated trajectories in the local frame."""
+    """Plot held-out and generated trajectories with the same map extent."""
+    from chabuduo.plotting import plot_samples
+
     configuration = _experiment_config(experiment, config)
     run_directory = run_path(configuration)
     result = plot_samples(
@@ -203,6 +227,19 @@ def plot_command(
         configuration,
         output=output,
     )
+    typer.echo(f"OUTPUT={result}")
+
+
+@app.command("plot-loss")
+def plot_loss_command(
+    run: Annotated[Path, typer.Argument(help="Training run directory")],
+    output: Annotated[Path | None, typer.Option(help="PNG output path")] = None,
+    warmup_epochs: Annotated[int, typer.Option(min=0)] = 20,
+) -> None:
+    """Plot saved train/validation losses without training again."""
+    from chabuduo.plotting import plot_loss_curves
+
+    result = plot_loss_curves(run, output=output, warmup_epochs=warmup_epochs)
     typer.echo(f"OUTPUT={result}")
 
 

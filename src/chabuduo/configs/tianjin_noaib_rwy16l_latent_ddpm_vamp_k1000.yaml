@@ -1,0 +1,103 @@
+name: tianjin_noaib_rwy16l_latent_ddpm_vamp_k1000
+dataset: tianjin
+version: v1
+source:
+  type: local_parquet
+  filename: landing_tianjin_2026_08_09_60nm_filtered_1s_noaib.parquet
+  columns:
+  - timestamp
+  - flight_id
+  - icao24
+  - callsign
+  - latitude
+  - longitude
+  - altitude
+  - groundspeed
+  - track
+  - vertical_rate
+  - onground
+preprocess:
+  operation: landing
+  airport: ZBTJ
+  runways:
+  - 16L
+  radius_nm: 60
+  max_threshold_distance_nm: 0.1
+  min_observations: 10
+  min_duration_sec: 600
+prepare:
+  points: 200
+  metadata_columns:
+  - runway
+  representation:
+    name: kinematic_200
+    features:
+    - track_unwrapped
+    - groundspeed_kt
+    - altitude_ft
+    - elapsed_time_sec
+    units:
+    - degree
+    - knot
+    - ft
+    - s
+    direction: chronological
+    anchor: runway_threshold
+  split:
+    group_by: flight_id
+    train: 0.7
+    validation: 0.15
+    test: 0.15
+    seed: 42
+  normalization:
+    method: standard_per_timestep
+    fit_on: train
+model:
+  type: latent_ddpm
+  architecture: residual_mlp
+  autoencoder:
+    run: runs/tianjin_noaib_rwy16l_tcvae_vamp_k1000-v1-seed-42
+    checkpoint: checkpoints/best.ckpt
+    prepared_artifact: data/processed/tianjin_noaib_rwy16l_tcvae_vamp_k1000-v1
+    expected_epoch: 262
+    expected_sha256: dcd6e4e6a76cd72dba1001ca4767d1196d8cb2a96476c5ad717cfdd4c7cd9825
+    expected_prior: vamp
+  latent:
+    dimension: 64
+    representation: posterior_sample
+    seed: 42
+    standardization: per_dimension_train
+  hidden_dim: 256
+  residual_blocks: 4
+  dropout: 0.1
+  time_embedding_dim: 128
+  diffusion_steps: 1000
+  beta_schedule: linear
+  prediction: noise
+optimizer:
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  lr_step_size: 200
+  lr_gamma: 0.5
+training:
+  seed: 42
+  batch_size: 32
+  max_epochs: 500
+  num_workers: 0
+  accelerator: auto
+  devices: 1
+  gradient_clip_norm: 1.0
+  mixed_precision: true
+  ema_decay: 0.999
+  early_stopping_patience: null
+  early_stopping_min_delta: 0.0
+sampling:
+  type: latent_ddpm
+  count: 500
+  seed: 42
+  steps: 100
+  eta: 0.0
+  minimum_groundspeed_kt: 30.0
+  maximum_groundspeed_kt: 600.0
+  minimum_altitude_ft: -1000.0
+  maximum_altitude_ft: 45000.0

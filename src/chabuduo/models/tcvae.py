@@ -1,4 +1,4 @@
-"""Standard-prior temporal convolutional variational autoencoder.
+"""Temporal convolutional variational autoencoder with standard or VampPrior.
 
 The temporal blocks and encoder/decoder layout are adapted from the MIT-licensed
 Code Ocean capsule "Deep Generative Modelling of Aircraft Trajectories in
@@ -145,12 +145,20 @@ class StandardTCVAE(nn.Module):
         dilation_base: int = 2,
         sampling_factor: int = 10,
         dropout: float = 0.2,
+        prior_type: str = "standard",
+        prior_components: int | None = None,
     ) -> None:
         super().__init__()
         if not hidden_channels:
             raise ValueError("hidden_channels cannot be empty")
         if sequence_length % sampling_factor != 0:
             raise ValueError("sequence_length must be divisible by sampling_factor")
+        if prior_type not in {"standard", "vamp"}:
+            raise ValueError(f"Unsupported TCVAE prior: {prior_type}")
+        if prior_type == "vamp" and (
+            prior_components is None or prior_components < 1
+        ):
+            raise ValueError("VampPrior requires at least one component")
 
         self.input_channels = input_channels
         self.sequence_length = sequence_length
@@ -158,6 +166,8 @@ class StandardTCVAE(nn.Module):
         self.latent_dim = latent_dim
         self.sampling_factor = sampling_factor
         self.pooled_length = sequence_length // sampling_factor
+        self.prior_type = prior_type
+        self.prior_components = prior_components if prior_type == "vamp" else None
 
         self.encoder_tcn = TemporalConvNet(
             input_channels,
@@ -187,6 +197,27 @@ class StandardTCVAE(nn.Module):
             dilation_base,
             dropout,
         )
+        if self.prior_type == "vamp":
+            self.pseudo_inputs = nn.Parameter(
+                torch.empty(
+                    int(self.prior_components), input_channels, sequence_length
+                )
+            )
+            nn.init.normal_(self.pseudo_inputs, mean=0.0, std=0.01)
+        else:
+            self.register_parameter("pseudo_inputs", None)
+
+    def initialize_pseudo_inputs(self, values: Tensor) -> None:
+        """Initialize VampPrior pseudo-inputs from normalized training examples."""
+        if self.pseudo_inputs is None:
+            return
+        if values.shape != self.pseudo_inputs.shape:
+            raise ValueError(
+                "Expected pseudo-input initialization with shape "
+                f"{tuple(self.pseudo_inputs.shape)}, got {tuple(values.shape)}"
+            )
+        with torch.no_grad():
+            self.pseudo_inputs.copy_(values.to(self.pseudo_inputs))
 
     def encode(self, value: Tensor) -> tuple[Tensor, Tensor]:
         hidden = self.encoder_pool(self.encoder_tcn(value)).flatten(start_dim=1)
@@ -212,12 +243,45 @@ class StandardTCVAE(nn.Module):
         return reconstruction, mean, log_variance
 
     @staticmethod
-    def kl_divergence(mean: Tensor, log_variance: Tensor) -> Tensor:
-        """Return the mean closed-form KL divergence to N(0, I)."""
-        per_sample = -0.5 * torch.sum(
-            1 + log_variance - mean.square() - log_variance.exp(), dim=1
+    def _diagonal_gaussian_log_prob(
+        value: Tensor, mean: Tensor, log_variance: Tensor
+    ) -> Tensor:
+        return -0.5 * (
+            torch.log(torch.tensor(2 * torch.pi, device=value.device))
+            + log_variance
+            + (value - mean).square() / log_variance.exp()
+        ).sum(dim=-1)
+
+    def prior_parameters(self) -> tuple[Tensor, Tensor]:
+        if self.pseudo_inputs is None:
+            raise RuntimeError("The standard normal prior has no learned components")
+        return self.encode(self.pseudo_inputs)
+
+    def kl_divergence(
+        self,
+        mean: Tensor,
+        log_variance: Tensor,
+        latent: Tensor | None = None,
+    ) -> Tensor:
+        """Return KL to the configured standard or VampPrior distribution."""
+        if self.prior_type == "standard":
+            per_sample = -0.5 * torch.sum(
+                1 + log_variance - mean.square() - log_variance.exp(), dim=1
+            )
+            return per_sample.mean()
+        if latent is None:
+            raise ValueError("VampPrior KL requires a posterior sample")
+        component_mean, component_log_variance = self.prior_parameters()
+        log_q = self._diagonal_gaussian_log_prob(latent, mean, log_variance)
+        log_components = self._diagonal_gaussian_log_prob(
+            latent[:, None, :],
+            component_mean[None, :, :],
+            component_log_variance[None, :, :],
         )
-        return per_sample.mean()
+        log_prior = torch.logsumexp(log_components, dim=1) - torch.log(
+            torch.tensor(log_components.shape[1], device=latent.device)
+        )
+        return (log_q - log_prior).mean()
 
     @torch.inference_mode()
     def sample(
@@ -229,7 +293,20 @@ class StandardTCVAE(nn.Module):
     ) -> Tensor:
         parameter = next(self.parameters())
         target_device = device or parameter.device
-        latent = temperature * torch.randn(count, self.latent_dim, device=target_device)
+        if self.prior_type == "standard":
+            latent = temperature * torch.randn(
+                count, self.latent_dim, device=target_device
+            )
+        else:
+            component_mean, component_log_variance = self.prior_parameters()
+            component = torch.randint(
+                len(component_mean), (count,), device=target_device
+            )
+            mean = component_mean[component]
+            standard_deviation = torch.exp(
+                0.5 * component_log_variance[component]
+            )
+            latent = mean + temperature * standard_deviation * torch.randn_like(mean)
         return self.decode(latent)
 
 
@@ -241,6 +318,7 @@ class TCVAELightning(L.LightningModule):
         self.save_hyperparameters({"resolved_config": resolved_config})
         self.resolved_config = resolved_config
         model = resolved_config["model"]
+        prior = model.get("prior", {"type": "standard"})
         self.network = StandardTCVAE(
             input_channels=int(model["input_channels"]),
             sequence_length=int(model["sequence_length"]),
@@ -250,6 +328,8 @@ class TCVAELightning(L.LightningModule):
             dilation_base=int(model["dilation_base"]),
             sampling_factor=int(model["sampling_factor"]),
             dropout=float(model["dropout"]),
+            prior_type=prior["type"],
+            prior_components=prior.get("components"),
         )
         loss_config = resolved_config["loss"]
         initial_scale = torch.tensor(float(loss_config.get("decoder_scale", 1.0)))
@@ -259,7 +339,9 @@ class TCVAELightning(L.LightningModule):
         )
 
     def compute_loss(self, value: Tensor) -> dict[str, Tensor]:
-        reconstruction, mean, log_variance = self.network(value)
+        mean, log_variance = self.network.encode(value)
+        latent = self.network.reparameterize(mean, log_variance)
+        reconstruction = self.network.decode(latent)
         log_scale = self.log_decoder_scale.clamp_min(-9.21034)
         scale = log_scale.exp()
         gaussian_nll = (
@@ -268,7 +350,7 @@ class TCVAELightning(L.LightningModule):
             + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=value.device))
         )
         reconstruction_loss = gaussian_nll.sum(dim=(1, 2)).mean()
-        kl_loss = self.network.kl_divergence(mean, log_variance)
+        kl_loss = self.network.kl_divergence(mean, log_variance, latent)
         loss_config = self.resolved_config["loss"]
         loss = (
             float(loss_config["reconstruction_weight"]) * reconstruction_loss

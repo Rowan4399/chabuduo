@@ -63,8 +63,10 @@ Source = Annotated[
 
 
 class PreprocessSettings(StrictModel):
-    operation: Literal["landing","takeoff"]
+    operation: Literal["landing", "takeoff"]
     airport: str = Field(pattern=r"^[A-Z0-9]{4}$")
+    runways: list[str] | None = None
+    initial_flows: list[str] | None = None
     radius_nm: PositiveFloat
     max_threshold_distance_nm: PositiveFloat
     min_observations: PositiveInt
@@ -115,6 +117,7 @@ class NormalizationSettings(StrictModel):
 
 class PrepareSettings(StrictModel):
     points: PositiveInt
+    metadata_columns: list[str] = Field(default_factory=list)
     representation: RepresentationSettings
     split: SplitSettings
     normalization: NormalizationSettings
@@ -152,8 +155,44 @@ class DDPMModelSettings(StrictModel):
     conditioning: ConditioningSettings | None = None
 
 
+class AutoencoderReferenceSettings(StrictModel):
+    run: str
+    checkpoint: str
+    prepared_artifact: str
+    expected_epoch: int = Field(ge=0)
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_prior: Literal["standard", "vamp"]
+
+
+class LatentRepresentationSettings(StrictModel):
+    dimension: PositiveInt
+    representation: Literal["posterior_sample"]
+    seed: int
+    standardization: Literal["per_dimension_train"]
+
+
+class LatentDDPMModelSettings(StrictModel):
+    type: Literal["latent_ddpm"]
+    architecture: Literal["residual_mlp"]
+    autoencoder: AutoencoderReferenceSettings
+    latent: LatentRepresentationSettings
+    hidden_dim: PositiveInt
+    residual_blocks: PositiveInt
+    dropout: float = Field(default=0.0, ge=0, lt=1)
+    time_embedding_dim: PositiveInt
+    diffusion_steps: int = Field(ge=2)
+    beta_schedule: Literal["linear"] = "linear"
+    prediction: Literal["noise"]
+
+    @model_validator(mode="after")
+    def timestep_embedding_is_even(self) -> LatentDDPMModelSettings:
+        if self.time_embedding_dim % 2:
+            raise ValueError("time_embedding_dim must be even")
+        return self
+
+
 ModelSettings = Annotated[
-    TCVAEModelSettings | DDPMModelSettings,
+    TCVAEModelSettings | DDPMModelSettings | LatentDDPMModelSettings,
     Field(discriminator="type"),
 ]
 
@@ -161,6 +200,14 @@ ModelSettings = Annotated[
 class OptimizerSettings(StrictModel):
     learning_rate: PositiveFloat
     weight_decay: float = Field(default=0, ge=0)
+    lr_step_size: PositiveInt | None = None
+    lr_gamma: float | None = Field(default=None, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def scheduler_settings_are_paired(self) -> OptimizerSettings:
+        if (self.lr_step_size is None) != (self.lr_gamma is None):
+            raise ValueError("lr_step_size and lr_gamma must be set together")
+        return self
 
 
 class TrainingSettings(StrictModel):
@@ -172,6 +219,9 @@ class TrainingSettings(StrictModel):
     devices: PositiveInt = 1
     gradient_clip_norm: PositiveFloat | None = None
     mixed_precision: bool = False
+    ema_decay: float | None = Field(default=None, gt=0, lt=1)
+    early_stopping_patience: PositiveInt | None = None
+    early_stopping_min_delta: float = Field(default=0.0, ge=0)
 
 
 class TCVAESamplingSettings(StrictModel):
@@ -193,8 +243,13 @@ class DDPMSamplingSettings(StrictModel):
     maximum_altitude_ft: float
 
 
+class LatentDDPMSamplingSettings(DDPMSamplingSettings):
+    type: Literal["latent_ddpm"]
+    steps: int = Field(ge=2)
+
+
 SamplingSettings = Annotated[
-    TCVAESamplingSettings | DDPMSamplingSettings,
+    TCVAESamplingSettings | DDPMSamplingSettings | LatentDDPMSamplingSettings,
     Field(discriminator="type"),
 ]
 
@@ -203,7 +258,7 @@ class ExperimentConfig(StrictModel):
     """One committed configuration for every stage of one experiment."""
 
     name: str
-    dataset: Literal["beijing", "zurich"]
+    dataset: Literal["beijing", "zurich", "tianjin"]
     version: str
     source: Source
     preprocess: PreprocessSettings
@@ -217,6 +272,9 @@ class ExperimentConfig(StrictModel):
     def model_and_sampling_match(self) -> ExperimentConfig:
         if self.model.type != self.sampling.type:
             raise ValueError("model and sampling types must match")
+        if self.model.type == "latent_ddpm":
+            if self.sampling.steps > self.model.diffusion_steps:
+                raise ValueError("sampling steps must not exceed diffusion_steps")
         return self
 
 
@@ -243,6 +301,9 @@ def selected_path(config: ExperimentConfig) -> Path:
 
 
 def prepared_path(config: ExperimentConfig) -> Path:
+    if config.model.type == "latent_ddpm":
+        path = Path(config.model.autoencoder.prepared_artifact)
+        return path if path.is_absolute() else PROJECT_ROOT / path
     return PROJECT_ROOT / "data" / "processed" / f"{config.name}-{config.version}"
 
 
@@ -260,7 +321,7 @@ def sample_path(config: ExperimentConfig, run: Path) -> Path:
     suffix = f"seed-{sampling.seed}-n-{sampling.count}"
     if sampling.type == "tcvae" and sampling.temperature != 1.0:
         suffix += f"-t-{sampling.temperature:g}"
-    if sampling.type == "ddpm":
+    if sampling.type in {"ddpm", "latent_ddpm"}:
         suffix += f"-steps-{sampling.steps}-eta-{sampling.eta:g}"
     return run / "samples" / suffix
 
